@@ -144,6 +144,97 @@ SHA256(salt + message[4] + message[7] + message[20] + CLI_VERSION).slice(0, 3)
 
 The salt is hardcoded in Claude Code's source. This changes per conversation because the user's message text changes.
 
+## Multi-account rotation
+
+A single Claude subscription has a rolling 5-hour window and a rolling 7-day
+quota. When either is spent, every request fails until it resets. The account
+pool lets you enroll several subscriptions and rotate to the next one
+automatically when the active account's window is exhausted.
+
+The pool is **opt-in**: with no accounts enrolled the plugin behaves exactly as
+it did before.
+
+### Enrolling accounts
+
+Both the Claude CLI keychain and OpenCode's `auth.json` hold exactly one Claude
+credential, so `claude login` overwrites whichever account was there before.
+Enrollment captures the current account into the pool first, which makes the
+sequence repeatable:
+
+```bash
+claude login          # as the first account
+claude-pool enroll    # label is derived from the account's email
+
+claude login          # as the second account
+claude-pool enroll
+
+claude-pool list      # confirm both are present
+```
+
+Pass a label explicitly to override the derived one: `claude-pool enroll work`.
+
+### Commands
+
+| Command | Purpose |
+| --- | --- |
+| `claude-pool enroll [label] [--replace]` | Add the account Claude CLI is logged into |
+| `claude-pool whoami` | Show which account Claude CLI is logged into, and whether it is pooled |
+| `claude-pool list` | Every enrolled account with its status and token expiry |
+| `claude-pool status` | Active account and what rotation would pick next |
+| `claude-pool remove <label>` | Drop an account |
+| `claude-pool clear-cooldowns` | Re-enable everything after a rate-limit storm |
+
+Run these as `node scripts/claude-pool.mjs <command>`.
+
+### When rotation happens
+
+Every failed response is classified before the response body is read:
+
+| Signal | Action |
+| --- | --- |
+| `429` with a reset under 60s | Back off, retry the **same** account |
+| `429` with a longer reset, or `anthropic-ratelimit-unified-status` not `allowed` | Cool the account down until its reset, switch accounts |
+| `403` naming suspension | Disable the account permanently, switch |
+| `401` | Credential rejected even after refresh — disable, switch |
+| Every account cooling | Fail fast as `429`, naming each account and the earliest reset |
+
+Reset windows are read from `retry-after`, then Anthropic's
+`anthropic-ratelimit-unified-*` headers (epoch seconds), preferring whichever
+window `representative-claim` reports as binding. When no reset can be
+determined the account is cooled rather than retried, because retrying a truly
+exhausted account is worse than briefly parking a healthy one.
+
+Rotation only occurs **before** the response body is read. Once SSE streaming
+has begun a second stream cannot be spliced into the first, so mid-stream
+errors are passed through untouched.
+
+### Where credentials live
+
+Accounts are stored one per macOS Keychain item under the service
+`opencode-claude-bridge` (a `0600` file per account on other platforms). The
+pool is the source of truth; OpenCode's single `anthropic` slot in `auth.json`
+is a mirror of whichever account is currently active.
+
+Rotation bookkeeping — active account, cooldowns, failure counts — lives
+separately in `~/.local/share/opencode-claude-bridge/rotation-state.json` and
+contains no secrets. It is written atomically and guarded by a cross-process
+lock, so several OpenCode processes can share one pool safely.
+
+### Refresh tokens rotate
+
+Anthropic issues a **new** refresh token on every refresh and invalidates the
+old one immediately, with no grace window. Losing the replacement permanently
+locks you out of that account.
+
+Refreshes therefore journal the new tokens to disk before committing them to
+the keychain, and any journal found at startup is replayed. Concurrent
+refreshes of one account collapse into a single call, since two parallel
+refreshes would spend the same token twice.
+
+The practical consequence: **after the pool refreshes an account, the Claude
+CLI's own stored copy of that credential is stale.** That is expected. Run
+`claude-pool list` rather than trusting the CLI's view.
+
 ## Requirements
 
 - [OpenCode](https://opencode.ai) v1.2+
