@@ -109,9 +109,17 @@ again from scratch.
 
 ### The cycle
 
-```bash
-alias claude-pool='node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs'
+Install the `claude-pool` command first (this also installs the auto-enroll
+hook described in the next section):
 
+```bash
+node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc
+source ~/.zshrc
+```
+
+Then:
+
+```bash
 claude login          # account #1
 claude-pool enroll    # label derived from its email
 
@@ -138,9 +146,12 @@ into an account the pool has not seen, and adopts it. Nothing to run.
 hook:
 
 ```bash
-claude-pool install-hook >> ~/.zshrc
+node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc
 source ~/.zshrc
 ```
+
+That defines a `claude-pool` shell function and wraps `claude`, so the full
+path is only needed this once.
 
 That wraps the `claude` command so a successful `claude login` is pooled right
 away. From then on the whole cycle is just:

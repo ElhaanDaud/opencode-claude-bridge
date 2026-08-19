@@ -182,7 +182,7 @@ on startup. For instant adoption without restarting OpenCode, install a shell
 hook so `claude login` enrolls as it completes:
 
 ```bash
-claude-pool install-hook >> ~/.zshrc && source ~/.zshrc
+node scripts/claude-pool.mjs install-hook >> ~/.zshrc && source ~/.zshrc
 ```
 
 Accounts are matched by refresh token, so re-logging into a pooled account is

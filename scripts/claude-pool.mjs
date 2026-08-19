@@ -116,7 +116,12 @@ async function auto() {
 
 async function installHook() {
   const self = new URL(import.meta.url).pathname;
-  console.log(`# Add to ~/.zshrc, then: source ~/.zshrc
+  console.log(`# --- opencode-claude-bridge account pool ---
+# Add to ~/.zshrc, then: source ~/.zshrc
+# A function, not an alias: aliases are expanded at parse time and are not
+# enabled in non-interactive shells, so they fail inside scripts.
+claude-pool() { node ${self} "$@"; }
+
 # Wraps the Claude CLI so every successful login is pooled automatically.
 claude() {
   command claude "$@"
