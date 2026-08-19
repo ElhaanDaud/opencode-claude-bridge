@@ -4,10 +4,23 @@ export const RETRY_SAME_MAX_RESET_SECONDS = 60;
 export const DEFAULT_UNKNOWN_COOLDOWN_MS = 3_600_000;
 export const MAX_TRANSIENT_ATTEMPTS = 3;
 
+// Verified against live Anthropic OAuth subscription traffic. Values are epoch
+// SECONDS, not RFC 3339. Subscription accounts are governed by two independent
+// windows (rolling 5-hour and rolling 7-day); "representative-claim" names
+// whichever one is currently binding.
 export const UNIFIED_RESET_HEADERS = [
   "anthropic-ratelimit-unified-reset",
   "anthropic-ratelimit-unified-5h-reset",
+  "anthropic-ratelimit-unified-7d-reset",
 ] as const;
+
+export const UNIFIED_STATUS_HEADER = "anthropic-ratelimit-unified-status";
+export const UNIFIED_CLAIM_HEADER = "anthropic-ratelimit-unified-representative-claim";
+
+const CLAIM_RESET_HEADERS: Record<string, string> = {
+  five_hour: "anthropic-ratelimit-unified-5h-reset",
+  seven_day: "anthropic-ratelimit-unified-7d-reset",
+};
 
 const TOKEN_RESET_HEADERS = [
   "anthropic-ratelimit-input-tokens-reset",
@@ -87,8 +100,31 @@ function resolveRetryAfter(headers: unknown, now: number): ResetWindow | undefin
   }
 }
 
+/**
+ * The account-level verdict. Anything other than "allowed" means this account
+ * is out for the current window, which no amount of retrying or token
+ * refreshing can clear — only using a different account will.
+ */
+export function unifiedStatusRejects(headers: unknown): boolean {
+  try {
+    const status = readHeader(headers, UNIFIED_STATUS_HEADER);
+    return typeof status === "string" && status.trim().toLowerCase() !== "allowed";
+  } catch {
+    return false;
+  }
+}
+
 function resolveUnifiedReset(headers: unknown, now: number): ResetWindow | undefined {
   try {
+    // Prefer the window the server says is actually binding.
+    const claim = readHeader(headers, UNIFIED_CLAIM_HEADER);
+    const claimHeader =
+      typeof claim === "string" ? CLAIM_RESET_HEADERS[claim.trim().toLowerCase()] : undefined;
+    if (claimHeader) {
+      const claimed = normalizeResetValue(readHeader(headers, claimHeader), now);
+      if (claimed !== undefined) return { seconds: claimed, source: "unified-reset" };
+    }
+
     for (const name of UNIFIED_RESET_HEADERS) {
       const seconds = normalizeResetValue(readHeader(headers, name), now);
       if (seconds !== undefined) return { seconds, source: "unified-reset" };
@@ -276,6 +312,21 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
       resolveUnifiedReset(input.headers, now) ??
       resolveTokenReset(input.headers, now) ??
       resolveBodyHint(input.bodyText, now);
+
+    // An explicit account-level rejection outranks the reset window. Without
+    // this, a short retry-after would keep us retrying an account whose 5-hour
+    // or 7-day quota is already spent.
+    if (unifiedStatusRejects(input.headers)) {
+      const durationMs = reset
+        ? safeDurationMs(reset.seconds)
+        : DEFAULT_UNKNOWN_COOLDOWN_MS;
+      return {
+        action: "ROTATE_COOLDOWN",
+        until: safeUntil(now, durationMs),
+        reason: `Account usage window rejected by Anthropic${reset ? `; resets in ${reset.seconds} seconds` : ""}`,
+        source: reset?.source ?? "default",
+      };
+    }
 
     if (reset !== undefined) return decisionFromReset(reset, now, input.attempt ?? 0);
     return {
