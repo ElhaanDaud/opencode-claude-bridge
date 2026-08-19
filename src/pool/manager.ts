@@ -82,6 +82,20 @@ export type AcquireResult =
   | { kind: "ok"; label: string; accessToken: string }
   | { kind: "exhausted"; info: ExhaustionInfo };
 
+/** Cooldown applied when a refresh fails for a reason that may resolve itself. */
+export const TRANSIENT_REFRESH_COOLDOWN_MS = 60_000;
+
+/**
+ * Distinguish "this credential is no longer valid" from "the token endpoint
+ * was unreachable". refreshTokens throws `Token refresh failed (<status>): …`,
+ * so both the HTTP status and the OAuth error code are available in the text.
+ */
+export function isCredentialRejected(detail: string): boolean {
+  return /invalid_grant|invalid_client|unauthorized_client|access_denied|\((?:400|401|403)\)/i.test(
+    detail,
+  );
+}
+
 export function defaultJournalPath(): string {
   return path.join(
     os.homedir(),
@@ -297,7 +311,19 @@ export function createRotationManager(opts: ManagerOptions) {
         record = { ...record, oauth: fresh };
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
-        await state.markDisabled(label, `refresh failed: ${detail}`);
+        // Only a rejected credential justifies permanent exclusion. A network
+        // blip or a 5xx from the token endpoint must cool the account down
+        // instead, or one transient outage disables every account in turn and
+        // wedges the pool with no automatic recovery.
+        if (isCredentialRejected(detail)) {
+          await state.markDisabled(label, `refresh rejected: ${detail}`);
+        } else {
+          await state.markCooldown(
+            label,
+            clock() + TRANSIENT_REFRESH_COOLDOWN_MS,
+            `refresh failed: ${detail}`,
+          );
+        }
         return acquire();
       }
     }

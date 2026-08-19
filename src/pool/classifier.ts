@@ -216,9 +216,17 @@ function safeUntil(now: number, durationMs: number): number {
   return Number.isFinite(until) ? until : Number.MAX_SAFE_INTEGER;
 }
 
-function decisionFromReset(reset: ResetWindow, now: number): RotationDecision {
+function decisionFromReset(
+  reset: ResetWindow,
+  now: number,
+  attempt: number,
+): RotationDecision {
   const durationMs = safeDurationMs(reset.seconds);
-  if (reset.seconds <= RETRY_SAME_MAX_RESET_SECONDS) {
+  // A short reset means "wait briefly and retry the same account" — but an
+  // account that keeps returning a short window would otherwise be retried
+  // forever, hanging the request. After a few attempts, treat it as exhausted
+  // and let rotation take over.
+  if (reset.seconds <= RETRY_SAME_MAX_RESET_SECONDS && attempt < MAX_TRANSIENT_ATTEMPTS) {
     return {
       action: "RETRY_SAME",
       backoffMs: Math.max(1000, durationMs),
@@ -269,7 +277,7 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
       resolveTokenReset(input.headers, now) ??
       resolveBodyHint(input.bodyText, now);
 
-    if (reset !== undefined) return decisionFromReset(reset, now);
+    if (reset !== undefined) return decisionFromReset(reset, now, input.attempt ?? 0);
     return {
       action: "ROTATE_COOLDOWN",
       until: safeUntil(now, DEFAULT_UNKNOWN_COOLDOWN_MS),

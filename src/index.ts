@@ -919,12 +919,19 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   headers[k.toLowerCase()] = v;
                 });
                 const bodyText = await response.text();
-                const rebuild = () =>
-                  new Response(bodyText, {
+                const rebuild = () => {
+                  // response.text() already decoded the body, so carrying the
+                  // original content-encoding/content-length would describe
+                  // bytes that no longer exist and corrupt the error downstream.
+                  const outbound = new Headers(response.headers);
+                  outbound.delete("content-encoding");
+                  outbound.delete("content-length");
+                  return new Response(bodyText, {
                     status: response.status,
                     statusText: response.statusText,
-                    headers: response.headers,
+                    headers: outbound,
                   });
+                };
 
                 const decision = pool.classifyResponse({
                   status: response.status,

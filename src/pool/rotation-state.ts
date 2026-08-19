@@ -76,7 +76,10 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
   const statePath = opts.path;
   const lockPath = `${statePath}.lock`;
   const clock: Clock = opts.clock ?? (() => Date.now());
-  const staleLockMs = opts.staleLockMs ?? 30_000;
+  // Must comfortably exceed the worst-case guarded operation. A token refresh
+  // runs up to 3 curl attempts at 30s each plus backoff (~100s), so a 30s
+  // threshold would declare a healthy, actively-refreshing holder "stale".
+  const staleLockMs = opts.staleLockMs ?? 180_000;
   const lockPollMs = opts.lockPollMs ?? 50;
   const lockTimeoutMs = opts.lockTimeoutMs ?? 10_000;
 
@@ -197,6 +200,24 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
    * observed. If they differ, someone already reclaimed it, so we put it back
    * and keep waiting.
    */
+  /**
+   * Age alone is not a crash signal — it is a timeout, and the guarded refresh
+   * can legitimately outlast it. Reclaiming a live holder lets two processes
+   * refresh one account concurrently, which rotates its refresh token twice and
+   * permanently bricks it. So on this host we require proof the process is
+   * actually gone. A lock from another host is unverifiable, so it falls back
+   * to the age heuristic.
+   */
+  function holderIsGone(payload: LockPayload): boolean {
+    if (payload.hostname !== os.hostname()) return true;
+    try {
+      process.kill(payload.pid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
   function tryReclaimStale(observed: LockPayload): boolean {
     const aside = `${lockPath}.${randomUUID()}.stale`;
     try {
@@ -232,14 +253,27 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
 
       const existing = readLock();
 
-      // An unparseable lockfile is treated as junk. Otherwise a single torn
-      // write would wedge the pool permanently with no way out.
+      // An unparseable lockfile is usually a torn write, which must not wedge
+      // the pool forever. But it is also what a lock looks like in the instant
+      // between being created and being written, so removing it on sight would
+      // evict a holder that is mid-acquisition. Only discard it once it is old
+      // enough that no in-progress acquisition could still be responsible.
       if (!existing) {
-        try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
+        let age = Infinity;
+        try {
+          age = clock() - fs.statSync(lockPath).mtimeMs;
+        } catch {
+          continue;
+        }
+        if (age > staleLockMs) {
+          try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
+        } else {
+          await sleep(lockPollMs);
+        }
         continue;
       }
 
-      if (clock() - existing.acquiredAt > staleLockMs) {
+      if (clock() - existing.acquiredAt > staleLockMs && holderIsGone(existing)) {
         if (tryReclaimStale(existing)) {
           const reclaimed = tryCreateLock();
           if (reclaimed) return reclaimed;

@@ -8,6 +8,7 @@
  */
 
 import http from "node:http";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { createRotationStateStore, defaultStatePath } from "../dist/pool/rotation-state.js";
 import OpenCodeClaudeBridge from "../dist/index.js";
@@ -83,8 +84,11 @@ function startMockUpstream(script) {
   });
 }
 
-function tokenTail(header) {
-  return header ? header.slice(-12) : "(none)";
+// Fingerprint rather than slice: comparing tokens must not print live
+// credential material, even a suffix, to the QA log.
+function tokenId(header) {
+  if (!header) return "(none)";
+  return createHash("sha256").update(header).digest("hex").slice(0, 10);
 }
 
 const results = [];
@@ -138,7 +142,7 @@ async function s2() {
   record(
     "S2 long reset window rotates account",
     res.status === 200 && rotated && cooled.length === 1,
-    `HTTP ${res.status} | token1=…${tokenTail(first)} token2=…${tokenTail(second)} rotated=${rotated} | cooled=${JSON.stringify(cooled.map(([l, a]) => [l, new Date(a.cooldownUntil).toISOString()]))}`,
+    `HTTP ${res.status} | token1=…${tokenId(first)} token2=…${tokenId(second)} rotated=${rotated} | cooled=${JSON.stringify(cooled.map(([l, a]) => [l, new Date(a.cooldownUntil).toISOString()]))}`,
   );
 }
 
