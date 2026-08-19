@@ -120,11 +120,12 @@ async function installHook() {
 # Wraps the Claude CLI so every successful login is pooled automatically.
 claude() {
   command claude "$@"
-  local status=$?
-  if [ "$1" = "login" ] && [ $status -eq 0 ]; then
+  # Not "status": zsh reserves it as a read-only alias for $?.
+  local claude_rc=$?
+  if [ "$1" = "login" ] && [ "$claude_rc" -eq 0 ]; then
     node ${self} auto
   fi
-  return $status
+  return "$claude_rc"
 }`);
 }
 
