@@ -175,6 +175,19 @@ claude-pool list      # confirm both are present
 
 Pass a label explicitly to override the derived one: `claude-pool enroll work`.
 
+### Automatic enrollment
+
+Once at least one account is pooled, the plugin adopts newly logged-in accounts
+on startup. For instant adoption without restarting OpenCode, install a shell
+hook so `claude login` enrolls as it completes:
+
+```bash
+claude-pool install-hook >> ~/.zshrc && source ~/.zshrc
+```
+
+Accounts are matched by refresh token, so re-logging into a pooled account is
+never duplicated. Set `CLAUDE_POOL_AUTO_ENROLL=0` to disable.
+
 ### Commands
 
 | Command | Purpose |

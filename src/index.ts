@@ -36,6 +36,8 @@ import {
 import type { ToolDefinition } from "./claude-tools.js";
 import { createSseProcessor } from "./stream.js";
 import { buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
+import { autoEnrollIfNew } from "./pool/enroll.js";
+import { createAccountStore, createSecretBackend } from "./pool/secret-store.js";
 import type { RotationManager } from "./pool/manager.js";
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -589,6 +591,21 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   let poolActive = false;
   try {
     poolActive = await pool.isActive();
+
+    // Adopt a newly logged-in account automatically. Only once the pool is
+    // already in use, so installing the plugin never silently captures
+    // credentials from someone who has not opted in.
+    if (poolActive && process.env.CLAUDE_POOL_AUTO_ENROLL !== "0") {
+      const adopted = await autoEnrollIfNew({
+        accounts: createAccountStore(createSecretBackend()),
+      });
+      if (adopted.status === "enrolled") {
+        console.error(
+          `[claude-pool] auto-enrolled "${adopted.label}" (${adopted.email}) from the Claude CLI`,
+        );
+      }
+    }
+
     if (poolActive) await pool.sync();
   } catch (err) {
     console.error(

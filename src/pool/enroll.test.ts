@@ -5,6 +5,7 @@ import {
   EnrollmentError,
   deriveLabelFromEmail,
   normalizeLabel,
+  autoEnrollIfNew,
   parseClaudeCredentials,
   toAccountRecord,
   enrollFromClaudeCli,
@@ -180,5 +181,107 @@ describe("duplicate enrollment", () => {
 
     assert.equal(record.enrolledAt, NOW);
     assert.equal((await store.listAccounts()).length, 1);
+  });
+});
+
+describe("automatic enrollment", () => {
+  const cli = (refresh: string, expiresInMs = 3_600_000) =>
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: `access-${refresh}`,
+        refreshToken: refresh,
+        expiresAt: NOW + expiresInMs,
+        subscriptionType: "max",
+      },
+    });
+
+  it("adopts an account the CLI is logged into but the pool has not seen", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW));
+
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => cli("sk-ant-ort01-fresh"),
+      resolveEmail: async () => "bob@example.com",
+    });
+
+    assert.equal(result.status, "enrolled");
+    assert.equal(result.label, "bob");
+    assert.equal((await store.listAccounts()).length, 2);
+  });
+
+  it("does nothing when the CLI account is already pooled", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW));
+
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => VALID_CLI_JSON,
+      resolveEmail: async () => "alice@example.com",
+    });
+
+    assert.equal(result.status, "already-enrolled");
+    assert.equal(result.label, "alice");
+    assert.equal((await store.listAccounts()).length, 1);
+  });
+
+  it("refuses to adopt an expired credential", async () => {
+    const store = createAccountStore(memoryBackend());
+
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => cli("sk-ant-ort01-dead", -1_000),
+      resolveEmail: async () => "bob@example.com",
+    });
+
+    // Enrolling a dead credential would add an account that can never serve a
+    // request and must then be disabled on first use.
+    assert.equal(result.status, "stale");
+    assert.equal((await store.listAccounts()).length, 0);
+  });
+
+  it("does not disturb the pool when the CLI is logged out", async () => {
+    const store = createAccountStore(memoryBackend());
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => { throw new EnrollmentError("no credentials"); },
+      resolveEmail: async () => undefined,
+    });
+
+    assert.equal(result.status, "unavailable");
+    assert.equal((await store.listAccounts()).length, 0);
+  });
+
+  it("disambiguates when the derived label is taken by another account", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("bob", parseClaudeCredentials(VALID_CLI_JSON), NOW));
+
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => cli("sk-ant-ort01-other"),
+      resolveEmail: async () => "bob@example.com",
+    });
+
+    assert.equal(result.status, "enrolled");
+    assert.equal(result.label, "bob-2");
+    assert.equal((await store.listAccounts()).length, 2);
+  });
+
+  it("skips accounts whose email cannot be resolved", async () => {
+    const store = createAccountStore(memoryBackend());
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => cli("sk-ant-ort01-anon"),
+      resolveEmail: async () => undefined,
+    });
+
+    assert.equal(result.status, "no-label");
+    assert.equal((await store.listAccounts()).length, 0);
   });
 });

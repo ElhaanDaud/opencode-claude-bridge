@@ -127,6 +127,45 @@ Repeat for as many accounts as you like. To choose the label yourself:
 claude-pool enroll work
 ```
 
+### Automatic enrollment
+
+Once the pool holds at least one account, new logins are adopted automatically.
+
+**On OpenCode startup** — the plugin checks whether the Claude CLI is logged
+into an account the pool has not seen, and adopts it. Nothing to run.
+
+**Immediately after a login**, without restarting OpenCode, install a shell
+hook:
+
+```bash
+claude-pool install-hook >> ~/.zshrc
+source ~/.zshrc
+```
+
+That wraps the `claude` command so a successful `claude login` is pooled right
+away. From then on the whole cycle is just:
+
+```bash
+claude login   # done — the account is in the pool
+```
+
+You can also run it manually at any time:
+
+```bash
+claude-pool auto
+```
+
+Auto-enrollment deliberately does nothing when:
+
+| Situation | Why |
+| --- | --- |
+| The pool is empty | Installing the plugin must never capture credentials from someone who has not opted in. Enroll one account by hand first. |
+| The account is already pooled | Matched by refresh token, so a re-login of the same account is not duplicated |
+| The CLI credential is expired | It would enter the pool only to fail its first request and be disabled |
+| The account email cannot be resolved | There is no basis for a label; use `claude-pool enroll <label>` |
+
+Set `CLAUDE_POOL_AUTO_ENROLL=0` to disable the startup check.
+
 ### Expected output
 
 ```

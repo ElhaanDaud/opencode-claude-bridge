@@ -214,3 +214,95 @@ export async function enrollFromClaudeCli(
   await opts.accounts.putAccount(record);
   return record;
 }
+
+export type AutoEnrollStatus =
+  | "enrolled"
+  | "already-enrolled"
+  | "stale"
+  | "unavailable"
+  | "no-label";
+
+export interface AutoEnrollResult {
+  status: AutoEnrollStatus;
+  label?: string;
+  email?: string;
+}
+
+export interface AutoEnrollOptions {
+  accounts: AccountStore;
+  clock?: Clock;
+  readCredentials?: () => string;
+  resolveEmail?: (accessToken: string) => Promise<string | undefined>;
+}
+
+/**
+ * Adopt whatever account the Claude CLI is currently logged into, if the pool
+ * has not seen it before.
+ *
+ * Accounts are matched by refresh token rather than by label, because the same
+ * person may re-login and receive different tokens, and two different accounts
+ * may derive the same label from their email.
+ *
+ * Never throws: this runs during plugin startup, where a failure to adopt a new
+ * account must not prevent the existing pool from serving requests.
+ */
+export async function autoEnrollIfNew(
+  opts: AutoEnrollOptions,
+): Promise<AutoEnrollResult> {
+  const now = (opts.clock ?? (() => Date.now()))();
+  const read = opts.readCredentials ?? readClaudeCliCredentialsRaw;
+  const resolve = opts.resolveEmail ?? lookupEmail;
+
+  let creds: ClaudeCliCredentials;
+  try {
+    creds = parseClaudeCredentials(read());
+  } catch {
+    return { status: "unavailable" };
+  }
+
+  const oauth = creds.claudeAiOauth;
+
+  // An expired credential would enter the pool only to fail its first request
+  // and be disabled, so leave it for an explicit `claude-pool enroll`.
+  if (oauth.expiresAt <= now) return { status: "stale" };
+
+  let existing: AccountRecord[];
+  try {
+    existing = await opts.accounts.listAccounts();
+  } catch {
+    return { status: "unavailable" };
+  }
+
+  const known = existing.find((a) => a.oauth.refresh === oauth.refreshToken);
+  if (known) return { status: "already-enrolled", label: known.label };
+
+  let email: string | undefined;
+  try {
+    email = await resolve(oauth.accessToken);
+  } catch {
+    email = undefined;
+  }
+  if (!email) return { status: "no-label" };
+
+  let label: string;
+  try {
+    label = deriveLabelFromEmail(email);
+  } catch {
+    return { status: "no-label" };
+  }
+
+  const taken = new Set(existing.map((a) => a.label));
+  if (taken.has(label)) {
+    let n = 2;
+    while (taken.has(`${label}-${n}`)) n += 1;
+    label = `${label}-${n}`;
+  }
+
+  try {
+    await opts.accounts.putAccount(toAccountRecord(label, creds, now, email));
+  } catch {
+    return { status: "unavailable" };
+  }
+
+  return { status: "enrolled", label, email };
+}

@@ -15,7 +15,7 @@
 
 import { createRotationStateStore, defaultStatePath } from "../dist/pool/rotation-state.js";
 import { createAccountStore, createSecretBackend } from "../dist/pool/secret-store.js";
-import { enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail } from "../dist/pool/enroll.js";
+import { enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew } from "../dist/pool/enroll.js";
 import { selectNext } from "../dist/pool/selection.js";
 
 const accounts = createAccountStore(createSecretBackend());
@@ -91,6 +91,41 @@ async function enroll(label, flags = []) {
     console.log("  claude login          # as the next account");
     console.log("  claude-pool enroll    # label is derived from its email");
   }
+}
+
+async function auto() {
+  const result = await autoEnrollIfNew({ accounts });
+  switch (result.status) {
+    case "enrolled":
+      await state.resetHealth(result.label);
+      console.log(`Enrolled "${result.label}" (${result.email}).`);
+      break;
+    case "already-enrolled":
+      console.log(`Already pooled as "${result.label}".`);
+      break;
+    case "stale":
+      console.log("Claude CLI credential is expired; run `claude login` first.");
+      break;
+    case "no-label":
+      console.log("Could not resolve the account email; use `claude-pool enroll <label>`.");
+      break;
+    default:
+      console.log("No Claude CLI credential found.");
+  }
+}
+
+async function installHook() {
+  const self = new URL(import.meta.url).pathname;
+  console.log(`# Add to ~/.zshrc, then: source ~/.zshrc
+# Wraps the Claude CLI so every successful login is pooled automatically.
+claude() {
+  command claude "$@"
+  local status=$?
+  if [ "$1" = "login" ] && [ $status -eq 0 ]; then
+    node ${self} auto
+  fi
+  return $status
+}`);
 }
 
 async function whoami() {
@@ -171,6 +206,8 @@ try {
     case "list": await list(); break;
     case "status": await status(); break;
     case "whoami": await whoami(); break;
+    case "auto": await auto(); break;
+    case "install-hook": await installHook(); break;
     case "remove": await remove(arg); break;
     case "clear-cooldowns": await clearCooldowns(); break;
     default:
@@ -179,6 +216,8 @@ try {
         "",
         "  enroll [label] [--replace]  add the account Claude CLI is logged into",
         "                              (label defaults to the account's email name)",
+        "  auto                        enroll the logged-in account if the pool has not seen it",
+        "  install-hook                print a shell function that runs `auto` after `claude login`",
         "  whoami                      show which account Claude CLI is logged into",
         "  list                        show every enrolled account and its status",
         "  status                      show active account and what rotation picks next",
