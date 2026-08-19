@@ -366,6 +366,16 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       });
     },
 
+    async resetHealth(label: string): Promise<void> {
+      await mutateAccount(label, (account, now) => {
+        account.disabled = false;
+        account.cooldownUntil = null;
+        account.failureCount = 0;
+        account.lastReason = null;
+        account.updatedAt = now;
+      });
+    },
+
     async markSuccess(label: string): Promise<void> {
       await mutateAccount(label, (account, now) => {
         account.cooldownUntil = null;

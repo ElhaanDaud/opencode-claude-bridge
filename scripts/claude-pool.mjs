@@ -74,7 +74,10 @@ async function list() {
 async function enroll(label) {
   if (!label) throw new Error("usage: claude-pool enroll <label>");
   const record = await enrollFromClaudeCli({ accounts, label });
-  await state.ensureAccount(label);
+  // Fresh credentials mean any prior disable/cooldown is stale. Without this,
+  // re-enrolling a revoked account reports success while rotation keeps
+  // skipping it.
+  await state.resetHealth(label);
   console.log(
     `Enrolled "${label}" (${record.email ?? "email unresolved"}), tier ${record.subscriptionType ?? "?"}.`,
   );

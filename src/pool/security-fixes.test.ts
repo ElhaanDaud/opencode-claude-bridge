@@ -62,6 +62,31 @@ describe("audit H2: refresh failure classification", () => {
   });
 });
 
+describe("re-enrollment restores a disabled account", () => {
+  it("clears disabled, cooldown and failure count when fresh credentials arrive", async (t) => {
+    const store = createRotationStateStore({ path: tempPath(t), clock: () => NOW });
+    await store.markDisabled("alice", "refresh rejected: invalid_grant");
+    await store.markCooldown("alice", NOW + 3_600_000, "exhausted");
+
+    await store.resetHealth("alice");
+
+    const account = store.load().accounts.alice;
+    // Enrolling new credentials that leave the account disabled would make
+    // rotation skip it forever while the CLI reports enrollment succeeded.
+    assert.equal(account?.disabled, false);
+    assert.equal(account?.cooldownUntil, null);
+    assert.equal(account?.failureCount, 0);
+  });
+
+  it("creates a healthy account when one does not exist yet", async (t) => {
+    const store = createRotationStateStore({ path: tempPath(t), clock: () => NOW });
+
+    await store.resetHealth("bob");
+
+    assert.equal(store.load().accounts.bob?.disabled, false);
+  });
+});
+
 describe("audit H1: stale lock reclaim requires a dead holder", () => {
   it("does not reclaim an aged lock whose holder is still alive", async (t) => {
     const statePath = tempPath(t);
