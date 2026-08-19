@@ -15,7 +15,7 @@
 
 import { createRotationStateStore, defaultStatePath } from "../dist/pool/rotation-state.js";
 import { createAccountStore, createSecretBackend } from "../dist/pool/secret-store.js";
-import { enrollFromClaudeCli, EnrollmentError } from "../dist/pool/enroll.js";
+import { enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail } from "../dist/pool/enroll.js";
 import { selectNext } from "../dist/pool/selection.js";
 
 const accounts = createAccountStore(createSecretBackend());
@@ -71,9 +71,12 @@ async function list() {
   console.log("\n* = active account (mirrored into opencode's anthropic slot)");
 }
 
-async function enroll(label) {
-  if (!label) throw new Error("usage: claude-pool enroll <label>");
-  const record = await enrollFromClaudeCli({ accounts, label });
+async function enroll(label, flags = []) {
+  const record = await enrollFromClaudeCli({
+    accounts,
+    label,
+    replace: flags.includes("--replace"),
+  });
   // Fresh credentials mean any prior disable/cooldown is stale. Without this,
   // re-enrolling a revoked account reports success while rotation keeps
   // skipping it.
@@ -81,8 +84,43 @@ async function enroll(label) {
   console.log(
     `Enrolled "${label}" (${record.email ?? "email unresolved"}), tier ${record.subscriptionType ?? "?"}.`,
   );
+  const total = (await accounts.listAccounts()).length;
+  console.log(`Pool now holds ${total} account${total === 1 ? "" : "s"}.`);
+  if (total < 2) {
+    console.log("Add another so rotation has somewhere to go:");
+    console.log("  claude login          # as the next account");
+    console.log("  claude-pool enroll    # label is derived from its email");
+  }
+}
+
+async function whoami() {
+  const creds = parseClaudeCredentials(readClaudeCliCredentialsRaw());
+  const email = await lookupEmail(creds.claudeAiOauth.accessToken);
+  const enrolled = (await accounts.listAccounts()).find(
+    (a) => a.oauth.refresh === creds.claudeAiOauth.refreshToken,
+  );
+  if (enrolled) {
+    console.log(`Claude CLI is logged in as: ${email ?? enrolled.email ?? "(unresolved)"}`);
+    console.log(`Already enrolled in the pool as "${enrolled.label}".`);
+    return;
+  }
+
+  if (!email) {
+    // The pool rotates refresh tokens, which supersedes the Claude CLI's own
+    // copy. A stale CLI credential therefore proves nothing about whether the
+    // underlying account is enrolled, so do not claim that it is not.
+    console.log("Claude CLI's stored credential is expired or superseded.");
+    console.log("It may already be in the pool under a newer token — check `claude-pool list`.");
+    console.log("To enroll this account fresh: run `claude login`, then `claude-pool enroll`.");
+    return;
+  }
+
+  console.log(`Claude CLI is logged in as: ${email}`);
+  const byEmail = (await accounts.listAccounts()).find((a) => a.email === email);
   console.log(
-    "To add another account: run `claude login` as that account, then `claude-pool enroll <other-label>`.",
+    byEmail
+      ? `That account is in the pool as "${byEmail.label}" (its token has since been rotated).`
+      : "Not yet in the pool. Run `claude-pool enroll` to add it.",
   );
 }
 
@@ -124,16 +162,33 @@ async function clearCooldowns() {
   console.log("Cleared all cooldowns and re-enabled every account.");
 }
 
-const [command, arg] = process.argv.slice(2);
+const [command, ...rest] = process.argv.slice(2);
+const flags = rest.filter((a) => a.startsWith("--"));
+const arg = rest.find((a) => !a.startsWith("--"));
 try {
   switch (command) {
-    case "enroll": await enroll(arg); break;
+    case "enroll": await enroll(arg, flags); break;
     case "list": await list(); break;
     case "status": await status(); break;
+    case "whoami": await whoami(); break;
     case "remove": await remove(arg); break;
     case "clear-cooldowns": await clearCooldowns(); break;
     default:
-      console.log("usage: claude-pool <enroll <label> | list | status | remove <label> | clear-cooldowns>");
+      console.log([
+        "usage: claude-pool <command>",
+        "",
+        "  enroll [label] [--replace]  add the account Claude CLI is logged into",
+        "                              (label defaults to the account's email name)",
+        "  whoami                      show which account Claude CLI is logged into",
+        "  list                        show every enrolled account and its status",
+        "  status                      show active account and what rotation picks next",
+        "  remove <label>              drop an account from the pool",
+        "  clear-cooldowns             re-enable everything after a rate-limit storm",
+        "",
+        "Adding accounts (repeat for as many as you like):",
+        "  claude login   # as the account you want to add",
+        "  claude-pool enroll",
+      ].join("\n"));
       process.exit(1);
   }
 } catch (err) {

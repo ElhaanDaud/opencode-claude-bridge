@@ -3,6 +3,8 @@ import { describe, it } from "node:test";
 
 import {
   EnrollmentError,
+  deriveLabelFromEmail,
+  normalizeLabel,
   parseClaudeCredentials,
   toAccountRecord,
   enrollFromClaudeCli,
@@ -107,6 +109,38 @@ describe("cli credentials to account record", () => {
     // that list() finds but the typed store refuses to parse.
     assert.deepEqual(await store.getAccount("alice"), record);
     assert.equal((await store.listAccounts()).length, 1);
+  });
+});
+
+describe("label handling for arbitrary accounts", () => {
+  it("derives a label from the account email", () => {
+    assert.equal(deriveLabelFromEmail("alice@example.com"), "alice");
+    assert.equal(deriveLabelFromEmail("bob.smith42@example.com"), "bob.smith42");
+    assert.equal(deriveLabelFromEmail("Work.Account+tag@corp.io"), "work.account");
+  });
+
+  it("accepts ordinary labels unchanged", () => {
+    for (const label of ["alice", "bob", "work-2", "team.lead", "acct_3"]) {
+      assert.equal(normalizeLabel(label), label);
+    }
+  });
+
+  it("rejects labels that could be read as a security(1) option", () => {
+    // `security find-generic-password -a -D ...` would reinterpret the label
+    // as a flag, so a leading dash must never reach the keychain backend.
+    for (const label of ["-D", "--delete", "-a"]) {
+      assert.throws(() => normalizeLabel(label), EnrollmentError);
+    }
+  });
+
+  it("rejects labels that could escape a directory or break storage", () => {
+    for (const label of ["../escape", "a/b", "", "   ", "a".repeat(200)]) {
+      assert.throws(() => normalizeLabel(label), EnrollmentError);
+    }
+  });
+
+  it("trims and lowercases so labels stay stable across enrollments", () => {
+    assert.equal(normalizeLabel("  Alice  "), "alice");
   });
 });
 
