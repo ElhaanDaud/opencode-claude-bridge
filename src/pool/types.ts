@@ -46,8 +46,26 @@ export interface AccountRecord {
   /** From the Claude CLI credentials, e.g. "default_claude_max_20x". */
   rateLimitTier?: string;
   scopes?: string[];
+  /** Account email, resolved from the OAuth profile endpoint at enrollment. */
+  email?: string;
   /** Epoch ms when this account was snapshotted into the pool. */
   enrolledAt: number;
+}
+
+/**
+ * The Claude CLI's own credential shape, as stored in the macOS keychain under
+ * service "Claude Code-credentials". Enrollment converts this into an
+ * {@link AccountRecord}; the two schemas are deliberately not interchangeable.
+ */
+export interface ClaudeCliCredentials {
+  claudeAiOauth: {
+    accessToken: string;
+    refreshToken: string;
+    expiresAt: number;
+    scopes?: string[];
+    subscriptionType?: string;
+    rateLimitTier?: string;
+  };
 }
 
 // ── Rotation state (hot store) ──────────────────────────────────────
