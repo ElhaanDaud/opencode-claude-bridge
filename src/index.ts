@@ -34,6 +34,8 @@ import {
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
 import { createSseProcessor } from "./stream.js";
+import { buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
+import type { RotationManager } from "./pool/manager.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -553,12 +555,35 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   const cachedClaudePromptCache = readCachedClaudePromptCache();
   const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
 
-  // Bootstrap auth from Claude CLI keychain at plugin init time — before
-  // OpenCode builds its provider state. This ensures the loader runs on
-  // startup so models appear immediately without requiring a restart.
+  // Multi-account pool. Inactive until the user enrolls an account, in which
+  // case every path below falls back to the original single-account behaviour.
+  const pool: RotationManager = createPool(client);
+  let poolActive = false;
   try {
-    const tokens = getClaudeTokens({ refreshExpired: false });
-    if (tokens) await storeAuth(client, tokens);
+    poolActive = await pool.isActive();
+    if (poolActive) await pool.sync();
+  } catch (err) {
+    console.error(
+      `[claude-pool] disabled (${err instanceof Error ? err.message : String(err)})`,
+    );
+    poolActive = false;
+  }
+
+  // Bootstrap auth at plugin init time — before OpenCode builds its provider
+  // state — so the loader runs on startup and models appear immediately
+  // without requiring a restart.
+  //
+  // With the pool active we seed from the pool rather than the Claude CLI
+  // keychain: that keychain holds whichever account `claude login` last used,
+  // so seeding from it would overwrite the active account on every startup and
+  // silently undo rotation.
+  try {
+    if (poolActive) {
+      await pool.acquire();
+    } else {
+      const tokens = getClaudeTokens({ refreshExpired: false });
+      if (tokens) await storeAuth(client, tokens);
+    }
   } catch {}
 
   return {
@@ -592,13 +617,20 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
         let auth = await getAuth();
 
-        // Auto-bootstrap from Claude CLI keychain if no OAuth tokens stored
+        // Auto-bootstrap if no OAuth tokens are stored. With the pool active
+        // this seeds from the pool, not the Claude CLI keychain, for the same
+        // anti-clobber reason as the init path above.
         if (auth.type !== "oauth") {
           try {
-            const tokens = getClaudeTokens({ refreshExpired: false });
-            if (tokens) {
-              await storeAuth(client, tokens);
-              auth = { type: "oauth", ...tokens };
+            if (poolActive) {
+              const acquired = await pool.acquire();
+              if (acquired.kind === "ok") auth = await getAuth();
+            } else {
+              const tokens = getClaudeTokens({ refreshExpired: false });
+              if (tokens) {
+                await storeAuth(client, tokens);
+                auth = { type: "oauth", ...tokens };
+              }
             }
           } catch {}
         }
@@ -628,7 +660,24 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             if (auth.type !== "oauth") return fetch(input, init);
 
             let accessToken = auth.access || null;
-            if (!accessToken || !auth.expires || auth.expires < Date.now()) {
+            // Label of the pool account serving this request, so a later
+            // rate-limit response can be attributed to the right account.
+            let activeLabel: string | null = null;
+
+            if (poolActive) {
+              const acquired = await pool.acquire();
+              if (acquired.kind === "exhausted") {
+                const message = pool.describeExhaustion(acquired.info);
+                console.error(`[claude-pool] ${message}`);
+                return buildPoolExhaustedResponse(
+                  message,
+                  acquired.info.earliestReset,
+                  Date.now(),
+                );
+              }
+              activeLabel = acquired.label;
+              accessToken = acquired.accessToken;
+            } else if (!accessToken || !auth.expires || auth.expires < Date.now()) {
               try {
                 accessToken = await refreshAuth(auth, client);
               } catch (err) {
@@ -851,9 +900,89 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             let response = await doFetch();
 
-            // 429 auto-refresh: rate limits are per-access-token, so refreshing
-            // the token gives us a fresh rate limit bucket. Try up to 2 retries.
-            if (response.status === 429) {
+            // Pool-aware failure handling. This runs BEFORE response.body is
+            // read below, which is the only point where rotation is safe: once
+            // SSE streaming has begun, a second stream's message ids and
+            // content-block indices cannot be spliced into the first.
+            //
+            // Only non-2xx bodies are consumed here (short JSON error
+            // envelopes, never a live stream), and they are rebuilt verbatim
+            // before being handed downstream.
+            if (poolActive && activeLabel && !response.ok) {
+              const maxRotations = (await pool.listLabels()).length;
+              let rotations = 0;
+              let attempt = 0;
+
+              for (;;) {
+                const headers: Record<string, string> = {};
+                response.headers.forEach((v, k) => {
+                  headers[k.toLowerCase()] = v;
+                });
+                const bodyText = await response.text();
+                const rebuild = () =>
+                  new Response(bodyText, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers,
+                  });
+
+                const decision = pool.classifyResponse({
+                  status: response.status,
+                  headers,
+                  bodyText,
+                  now: Date.now(),
+                  attempt,
+                });
+
+                if (decision.action === "PASS_THROUGH") return rebuild();
+
+                if (decision.action === "RETRY_SAME") {
+                  attempt += 1;
+                  console.error(
+                    `[claude-pool] ${activeLabel}: ${decision.reason}; retrying in ${decision.backoffMs ?? 1000}ms`,
+                  );
+                  await new Promise((r) => setTimeout(r, decision.backoffMs ?? 1000));
+                  response = await doFetch();
+                  if (response.ok) break;
+                  continue;
+                }
+
+                // ROTATE_COOLDOWN / ROTATE_DISABLE
+                console.error(
+                  `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
+                );
+                await pool.applyDecision(activeLabel, decision);
+
+                rotations += 1;
+                if (rotations > maxRotations) return rebuild();
+
+                const next = await pool.acquire();
+                if (next.kind === "exhausted") {
+                  const message = pool.describeExhaustion(next.info);
+                  console.error(`[claude-pool] ${message}`);
+                  return buildPoolExhaustedResponse(
+                    message,
+                    next.info.earliestReset,
+                    Date.now(),
+                  );
+                }
+
+                activeLabel = next.label;
+                outHeaders["authorization"] = `Bearer ${next.accessToken}`;
+                attempt = 0;
+                console.error(`[claude-pool] now using account "${activeLabel}"`);
+                response = await doFetch();
+                if (response.ok) break;
+              }
+            }
+
+            if (poolActive && activeLabel && response.ok) {
+              await pool.markSuccess(activeLabel);
+            }
+
+            // Legacy single-account path: refresh the token and retry, on the
+            // assumption that rate limits are per-access-token.
+            if (!poolActive && response.status === 429) {
               for (let retry = 0; retry < 2; retry++) {
                 console.error(`[opencode-claude-bridge] 429 rate limited (attempt ${retry + 1}/2), refreshing token...`);
                 let freshToken: string | null = null;
