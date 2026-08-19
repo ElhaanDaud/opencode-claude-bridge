@@ -285,8 +285,17 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
 
   if (status >= 200 && status < 300) return passThrough("Successful response");
 
-  // OAuth refresh already ran upstream; passing 401 through preserves genuine auth errors.
-  if (status === 401) return passThrough("Authentication error after upstream refresh");
+  // A 401 here means our own refresh already ran and the credential was still
+  // rejected (revoked, or its refresh token was spent elsewhere). Passing it
+  // through surfaces a hard auth error to the user while other healthy accounts
+  // sit unused, so the account is excluded and rotation takes over instead.
+  if (status === 401) {
+    return {
+      action: "ROTATE_DISABLE",
+      reason: "Anthropic rejected this account's credential; re-login required",
+      source: "status",
+    };
+  }
 
   if (status === 403) {
     const body = typeof input.bodyText === "string" ? input.bodyText.toLowerCase() : "";

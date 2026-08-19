@@ -10,6 +10,7 @@
 import http from "node:http";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { createRotationStateStore, defaultStatePath } from "../dist/pool/rotation-state.js";
 import OpenCodeClaudeBridge from "../dist/index.js";
 
@@ -20,6 +21,26 @@ function resetState() {
   try { fs.rmSync(statePath, { force: true }); } catch {}
   try { fs.rmSync(`${statePath}.lock`, { force: true }); } catch {}
 }
+
+// This harness drives the real plugin, which resolves the production rotation
+// state path. Scenarios deliberately corrupt that state, so the live file is
+// snapshotted here and restored on exit -- otherwise running QA silently
+// discards which account is active and which are cooling down.
+const savedState = (() => {
+  try { return fs.readFileSync(statePath, "utf8"); } catch { return null; }
+})();
+
+function restoreLiveState() {
+  try { fs.rmSync(`${statePath}.lock`, { force: true }); } catch {}
+  if (savedState === null) {
+    try { fs.rmSync(statePath, { force: true }); } catch {}
+    return;
+  }
+  fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(statePath, savedState, { mode: 0o600 });
+}
+
+process.on("exit", restoreLiveState);
 
 function fakeClient() {
   const store = { value: null };
@@ -223,8 +244,41 @@ async function s5() {
   );
 }
 
+// ── S6: revoked credential (401) disables and rotates ───────────────
+// Reproduces the real incident: a spent refresh token left the account
+// returning "OAuth access token has been revoked", which previously passed
+// straight through to the user instead of rotating to a healthy account.
+async function s6() {
+  resetState();
+  const up = await startMockUpstream([
+    {
+      status: 401,
+      body: { type: "error", error: { type: "authentication_error", message: "OAuth access token has been revoked." } },
+    },
+    { status: 200, body: { type: "message", content: [] } },
+  ]);
+  const client = fakeClient();
+  const doFetch = await makeFetch(client);
+  const res = await doFetch(up.url, {
+    method: "POST",
+    body: messagesBody(),
+    headers: { "content-type": "application/json" },
+  });
+  await res.text();
+
+  const disabled = Object.entries(state.load().accounts).filter(([, a]) => a.disabled);
+  const rotated = up.seen[0]?.auth !== up.seen[1]?.auth;
+  await up.close();
+
+  record(
+    "S6 revoked credential disables account and rotates",
+    res.status === 200 && disabled.length === 1 && rotated,
+    `HTTP ${res.status} | rotated=${rotated} | disabled=${JSON.stringify(disabled.map(([l, a]) => [l, a.lastReason]))}`,
+  );
+}
+
 const only = process.argv[2];
-const all = { s1, s2, s3, s4, s5 };
+const all = { s1, s2, s3, s4, s5, s6 };
 for (const [name, fn] of Object.entries(all)) {
   if (only && only !== name) continue;
   try {
@@ -234,7 +288,7 @@ for (const [name, fn] of Object.entries(all)) {
   }
 }
 
-resetState();
+restoreLiveState();
 const failed = results.filter((r) => !r.pass);
 console.log(`\n===== ${results.length - failed.length}/${results.length} scenarios passed =====`);
 process.exit(failed.length === 0 ? 0 : 1);

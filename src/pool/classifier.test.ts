@@ -106,11 +106,18 @@ describe("classify", () => {
     assert.equal(decision.source, "default");
   });
 
-  it("passes a 401 through", () => {
-    const decision = classify(input({ status: 401 }));
+  it("disables and rotates a revoked OAuth credential", () => {
+    const decision = classify(input({
+      status: 401,
+      bodyText: JSON.stringify({
+        type: "error",
+        error: { type: "authentication_error", message: "OAuth access token has been revoked." },
+      }),
+    }));
 
-    assert.equal(decision.action, "PASS_THROUGH");
+    assert.equal(decision.action, "ROTATE_DISABLE");
     assert.equal(decision.source, "status");
+    assert.match(decision.reason, /rejected.*credential/i);
   });
 
   it("passes a 2xx response through without inspecting its body", () => {
