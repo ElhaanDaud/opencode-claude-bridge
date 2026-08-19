@@ -252,7 +252,58 @@ describe("tool schema selection", () => {
       { name: "webfetch" },
       { name: "websearch_cited" },
     ]).map((tool) => tool.name).sort();
-    assert.deepEqual(out, ["WebFetch"]);
+    assert.ok(!out.includes("WebSearch"));
+    assert.deepEqual(out, ["WebFetch", "websearch_cited"]);
+  });
+
+  it("passes through plugin tools that have no Claude counterpart", () => {
+    const compress = {
+      name: "compress",
+      description: "Compress conversation history",
+      input_schema: { type: "object", properties: {} },
+    };
+    const out = getClaudeToolsForActiveOpenCodeTools([{ name: "bash" }, compress]);
+
+    assert.deepEqual(out.map((tool) => tool.name), ["Bash", "compress"]);
+    assert.equal(out[1], compress);
+  });
+
+  it("passes through MCP tools untouched", () => {
+    const out = getClaudeToolsForActiveOpenCodeTools([
+      { name: "read" },
+      { name: "context7_resolve-library-id" },
+      { name: "headroom_retrieve" },
+    ]).map((tool) => tool.name);
+
+    assert.deepEqual(out, ["Read", "context7_resolve-library-id", "headroom_retrieve"]);
+  });
+
+  it("replaces mapped tools with the wire-captured Claude schema", () => {
+    const [bash] = getClaudeToolsForActiveOpenCodeTools([
+      { name: "bash", description: "opencode description", input_schema: {} },
+    ]);
+
+    assert.equal(bash.name, "Bash");
+    assert.notEqual(bash.description, "opencode description");
+  });
+
+  it("orders output deterministically regardless of input order", () => {
+    const names = (tools: unknown[]) =>
+      getClaudeToolsForActiveOpenCodeTools(tools).map((tool) => tool.name);
+    const forward = names([{ name: "zeta_tool" }, { name: "bash" }, { name: "alpha_tool" }]);
+    const reverse = names([{ name: "alpha_tool" }, { name: "bash" }, { name: "zeta_tool" }]);
+
+    assert.deepEqual(forward, ["Bash", "alpha_tool", "zeta_tool"]);
+    assert.deepEqual(forward, reverse);
+  });
+
+  it("deduplicates repeated passthrough tools", () => {
+    const out = getClaudeToolsForActiveOpenCodeTools([
+      { name: "compress" },
+      { name: "compress" },
+    ]).map((tool) => tool.name);
+
+    assert.deepEqual(out, ["compress"]);
   });
 
   it("does not advertise AskUserQuestion when OpenCode did not enable question", () => {

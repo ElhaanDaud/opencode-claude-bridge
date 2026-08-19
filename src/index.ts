@@ -33,6 +33,7 @@ import {
   extractFirstUserMessageText,
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
+import type { ToolDefinition } from "./claude-tools.js";
 import { createSseProcessor } from "./stream.js";
 import { buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
 import type { RotationManager } from "./pool/manager.js";
@@ -232,21 +233,48 @@ export function shouldInjectClaudeTools(input: {
   return Array.isArray(input.tools) && input.tools.length > 0;
 }
 
+export type OutboundTool = ToolDefinition | { name: string;[key: string]: unknown };
+
+/**
+ * Tools with a Claude Code counterpart are swapped for the wire-captured Claude
+ * schema; tools without one (plugin/MCP, e.g. DCP's `compress`) keep their own
+ * schema rather than being dropped.
+ */
 export function getClaudeToolsForActiveOpenCodeTools(
   tools: unknown,
-): ReturnType<typeof getClaudeTools> {
+): OutboundTool[] {
   if (!Array.isArray(tools)) return [];
-  const activeClaudeNames = new Set(
-    tools
-      .map((tool) => {
-        if (!tool || typeof tool !== "object") return undefined;
-        const name = (tool as { name?: unknown }).name;
-        if (typeof name !== "string") return undefined;
-        return OUTBOUND_TOOL_NAME_MAP[name] || name;
-      })
-      .filter((name): name is string => typeof name === "string"),
+
+  const claudeCatalog = getClaudeTools();
+  const claudeCatalogNames = new Set(claudeCatalog.map((tool) => tool.name));
+
+  const matchedClaudeNames = new Set<string>();
+  const unmatchedByName = new Map<string, OutboundTool>();
+
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const name = (tool as { name?: unknown }).name;
+    if (typeof name !== "string") continue;
+
+    const claudeName = OUTBOUND_TOOL_NAME_MAP[name] || name;
+    if (claudeCatalogNames.has(claudeName)) {
+      matchedClaudeNames.add(claudeName);
+    } else if (!unmatchedByName.has(name)) {
+      unmatchedByName.set(name, tool as OutboundTool);
+    }
+  }
+
+  // Ordering is deterministic to keep the serialized prefix byte-stable across
+  // turns: the bridge strips explicit cache_control and depends entirely on
+  // Anthropic's implicit prefix caching.
+  const passthrough = [...unmatchedByName.values()].sort((a, b) =>
+    a.name.localeCompare(b.name),
   );
-  return getClaudeTools().filter((tool) => activeClaudeNames.has(tool.name));
+
+  return [
+    ...claudeCatalog.filter((tool) => matchedClaudeNames.has(tool.name)),
+    ...passthrough,
+  ];
 }
 
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
