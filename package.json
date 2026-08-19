@@ -12,7 +12,7 @@
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test dist/index.test.js",
+    "test": "npm run build && node --test \"dist/**/*.test.js\"",
     "validate:oauth": "npm run build && node scripts/validate-opencode-oauth.js"
   },
   "keywords": [
