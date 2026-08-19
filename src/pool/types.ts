@@ -38,7 +38,7 @@ export interface PoolOAuthTokens {
  * value of a single keychain item (or one 0600 file on non-darwin).
  */
 export interface AccountRecord {
-  /** Stable user-chosen identifier, e.g. "alice". Also the keychain `acct`. */
+  /** Stable user-chosen identifier, e.g. "work". Also the keychain `acct`. */
   label: string;
   oauth: PoolOAuthTokens;
   /** From the Claude CLI credentials, e.g. "max". Informational only. */

@@ -210,7 +210,8 @@ async function s4() {
   await up.close();
 
   const msg = body?.error?.message ?? "";
-  const namesBoth = msg.includes("alice") && msg.includes("bob");
+  const labels = Object.keys(state.load().accounts);
+  const namesBoth = labels.length > 0 && labels.every((l) => msg.includes(l));
   record(
     "S4 full exhaustion fails fast",
     res.status === 429 && namesBoth && Number(retryAfter) > 0,

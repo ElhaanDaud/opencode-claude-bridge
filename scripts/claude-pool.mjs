@@ -7,9 +7,9 @@
  * and `claude login` overwrites it:
  *
  *   claude login                      # as the first account
- *   claude-pool enroll alice
+ *   claude-pool enroll personal
  *   claude login                      # as the second account
- *   claude-pool enroll bob
+ *   claude-pool enroll work
  *   claude-pool list
  */
 
