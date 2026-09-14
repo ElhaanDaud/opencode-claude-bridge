@@ -25,6 +25,7 @@ import {
   DEFAULT_EFFORT,
   CLEAR_THINKING_TYPE,
   SESSION_ID,
+  PLUGIN_ID,
 } from "./constants.js";
 import {
   getClaudeTools,
@@ -89,18 +90,23 @@ const OUTBOUND_TOOL_NAME_MAP: Record<string, string> = {
   webfetch: "WebFetch",
   todowrite: "TodoWrite",
   skill: "Skill",
-  mcp_bash: "Bash",
-  mcp_read: "Read",
-  mcp_glob: "Glob",
-  mcp_grep: "Grep",
-  mcp_edit: "Edit",
-  mcp_write: "Write",
-  mcp_task: "Agent",
-  mcp_webfetch: "WebFetch",
-  mcp_todowrite: "TodoWrite",
-  mcp_skill: "Skill",
   question: "AskUserQuestion",
-  mcp_question: "AskUserQuestion",
+  plan_enter: "EnterPlanMode",
+  plan_exit: "ExitPlanMode",
+};
+
+const ACTIVE_TOOL_SCHEMA_NAME_MAP: Record<string, string> = {
+  bash: "Bash",
+  read: "Read",
+  glob: "Glob",
+  grep: "Grep",
+  edit: "Edit",
+  write: "Write",
+  task: "Agent",
+  webfetch: "WebFetch",
+  todowrite: "TodoWrite",
+  skill: "Skill",
+  question: "AskUserQuestion",
   plan_enter: "EnterPlanMode",
   plan_exit: "ExitPlanMode",
 };
@@ -352,48 +358,77 @@ export function shouldInjectClaudeTools(input: {
   return Array.isArray(input.tools) && input.tools.length > 0;
 }
 
-export type OutboundTool = ToolDefinition | { name: string;[key: string]: unknown };
+function getToolName(tool: unknown): string | undefined {
+  if (!tool || typeof tool !== "object") return undefined;
+  const name = (tool as { name?: unknown }).name;
+  return typeof name === "string" ? name : undefined;
+}
 
-/**
- * Tools with a Claude Code counterpart are swapped for the wire-captured Claude
- * schema; tools without one (plugin/MCP, e.g. DCP's `compress`) keep their own
- * schema rather than being dropped.
- */
+function getToolInputSchema(tool: unknown): Record<string, unknown> | undefined {
+  if (!tool || typeof tool !== "object") return undefined;
+  const inputSchema = (tool as { input_schema?: unknown }).input_schema;
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return undefined;
+  return inputSchema as Record<string, unknown>;
+}
+
 export function getClaudeToolsForActiveOpenCodeTools(
   tools: unknown,
-): OutboundTool[] {
+): ToolDefinition[] {
   if (!Array.isArray(tools)) return [];
-
-  const claudeCatalog = getClaudeTools();
-  const claudeCatalogNames = new Set(claudeCatalog.map((tool) => tool.name));
-
-  const matchedClaudeNames = new Set<string>();
-  const unmatchedByName = new Map<string, OutboundTool>();
+  const claudeToolsByName = new Map(getClaudeTools().map((tool) => [tool.name, tool]));
+  const selectedToolsByName = new Map<string, ToolDefinition>();
 
   for (const tool of tools) {
-    if (!tool || typeof tool !== "object") continue;
-    const name = (tool as { name?: unknown }).name;
-    if (typeof name !== "string") continue;
+    const name = getToolName(tool);
+    if (!name) continue;
 
-    const claudeName = OUTBOUND_TOOL_NAME_MAP[name] || name;
-    if (claudeCatalogNames.has(claudeName)) {
-      matchedClaudeNames.add(claudeName);
-    } else if (!unmatchedByName.has(name)) {
-      unmatchedByName.set(name, tool as OutboundTool);
+    const claudeName = ACTIVE_TOOL_SCHEMA_NAME_MAP[name];
+    if (claudeName) {
+      const claudeTool = claudeToolsByName.get(claudeName);
+      if (!claudeTool) continue;
+      selectedToolsByName.set(claudeName, claudeTool);
+      continue;
     }
+
+    const inputSchema = getToolInputSchema(tool);
+    if (!inputSchema) {
+      console.error(
+        `[opencode-claude-bridge] Dropping active tool "${name}" — missing or invalid input_schema`,
+      );
+      continue;
+    }
+
+    const description = (tool as { description?: unknown }).description;
+    selectedToolsByName.set(name, {
+      name,
+      description: typeof description === "string" ? description : "",
+      input_schema: inputSchema,
+    });
   }
 
-  // Ordering is deterministic to keep the serialized prefix byte-stable across
-  // turns: the bridge strips explicit cache_control and depends entirely on
-  // Anthropic's implicit prefix caching.
-  const passthrough = [...unmatchedByName.values()].sort((a, b) =>
-    a.name.localeCompare(b.name),
-  );
+  // Claude core tools first, then custom/MCP tools, each sorted: matches
+  // Claude Code's wire order and keeps the serialized prefix byte-stable, since
+  // the bridge strips cache_control and relies on implicit prefix caching.
+  const byName = (x: ToolDefinition, y: ToolDefinition) => x.name.localeCompare(y.name);
+  const selected = Array.from(selectedToolsByName.values());
+  const isCore = (tool: ToolDefinition) => claudeToolsByName.get(tool.name) === tool;
+  return [...selected.filter(isCore).sort(byName), ...selected.filter((t) => !isCore(t)).sort(byName)];
+}
 
-  return [
-    ...claudeCatalog.filter((tool) => matchedClaudeNames.has(tool.name)),
-    ...passthrough,
-  ];
+export function getInboundToolNameMapForActiveOpenCodeTools(
+  tools: unknown,
+): Record<string, string> {
+  if (!Array.isArray(tools)) return {};
+  const inboundToolNameMap: Record<string, string> = {};
+
+  for (const tool of tools) {
+    const name = getToolName(tool);
+    if (!name) continue;
+    const claudeName = ACTIVE_TOOL_SCHEMA_NAME_MAP[name];
+    if (claudeName) inboundToolNameMap[claudeName] = name;
+  }
+
+  return inboundToolNameMap;
 }
 
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
@@ -605,7 +640,7 @@ function deduplicatePrefix(text: string): string {
   return text;
 }
 
-function mapOutboundToolName(name: string | undefined): string | undefined {
+export function mapOutboundToolName(name: string | undefined): string | undefined {
   if (!name) return name;
   return OUTBOUND_TOOL_NAME_MAP[name] || name;
 }
@@ -1002,6 +1037,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             let ownsUserId = false;
 
             let body = init?.body;
+            let inboundToolNameMap = INBOUND_TOOL_NAME_MAP;
             if (body && typeof body === "string") {
               try {
                 const parsed = JSON.parse(body);
@@ -1109,6 +1145,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 // requests or Claude-family models on Anthropic-compatible
                 // routers such as OpenRouter.
                 if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
+                  inboundToolNameMap = getInboundToolNameMapForActiveOpenCodeTools(parsed.tools);
                   parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
                 }
                 delete parsed.tool_choice;
@@ -1401,7 +1438,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             // split across TCP chunks) that regex-on-raw-bytes can't
             // handle. See src/stream.ts for the processor implementation.
             const processor = createSseProcessor({
-              inboundToolNameMap: INBOUND_TOOL_NAME_MAP,
+              inboundToolNameMap,
               translateToolArgs: translateToolArgsJsonString,
               debug: (msg) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
             });
@@ -1600,4 +1637,15 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   };
 };
 
-export default OpenCodeClaudeBridge;
+/**
+ * opencode plugin module.
+ *
+ * The `{ id, server }` shape is what opencode's plugin loader looks for. A bare
+ * function default export makes it fall back to its legacy path, which treats
+ * every named export of this module as a plugin factory and invokes it with
+ * `(input, options)` — crashing on the helpers exported here for tests.
+ */
+export default {
+  id: PLUGIN_ID,
+  server: OpenCodeClaudeBridge,
+};

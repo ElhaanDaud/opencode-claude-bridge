@@ -73,7 +73,7 @@ async function sendWith(replies: Record<string, Reply>): Promise<{ status: numbe
     return new Response(reply.body, { status: reply.status, headers: reply.headers });
   }) as typeof fetch;
 
-  const hooks = await plugin({ client: { auth: { set: async () => {} } } });
+  const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
   const loaded = await hooks.auth.loader(
     async () => ({ type: "oauth", access: "unused", refresh: "unused", expires: Date.now() + 3_600_000 }),
     { models: {} },

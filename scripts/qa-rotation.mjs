@@ -13,7 +13,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRotationStateStore, defaultLockPath, defaultStatePath } from "../dist/pool/rotation-state.js";
-import OpenCodeClaudeBridge from "../dist/index.js";
+import BridgePlugin from "../dist/index.js";
+const OpenCodeClaudeBridge = BridgePlugin.server;
 
 // A running OpenCode writes the live state file under its own lock while this
 // harness deletes and rewrites it, so the two raced and scenario penalties

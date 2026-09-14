@@ -19,11 +19,14 @@ import {
 } from "./claude-tools.js";
 import { extractOAuthErrorDetail } from "./oauth.js";
 import {
+  default as pluginModule,
   deriveModelDisplayName,
   failureSignature,
   getClaudeToolsForActiveOpenCodeTools,
   normalizeThinkingForHaiku55,
   normalizeThinkingForSonnet55,
+  getInboundToolNameMapForActiveOpenCodeTools,
+  mapOutboundToolName,
   rewriteSystemBlocksForModel,
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
@@ -340,7 +343,15 @@ describe("tool schema selection", () => {
   it("does not advertise WebSearch when only a custom websearch_cited tool is active", () => {
     const out = getClaudeToolsForActiveOpenCodeTools([
       { name: "webfetch" },
-      { name: "websearch_cited" },
+      {
+        name: "websearch_cited",
+        description: "Search the web with citations",
+        input_schema: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+      },
     ]).map((tool) => tool.name).sort();
     assert.ok(!out.includes("WebSearch"));
     assert.deepEqual(out, ["WebFetch", "websearch_cited"]);
@@ -355,14 +366,14 @@ describe("tool schema selection", () => {
     const out = getClaudeToolsForActiveOpenCodeTools([{ name: "bash" }, compress]);
 
     assert.deepEqual(out.map((tool) => tool.name), ["Bash", "compress"]);
-    assert.equal(out[1], compress);
+    assert.deepEqual(out[1], compress);
   });
 
   it("passes through MCP tools untouched", () => {
     const out = getClaudeToolsForActiveOpenCodeTools([
       { name: "read" },
-      { name: "context7_resolve-library-id" },
-      { name: "headroom_retrieve" },
+      { name: "context7_resolve-library-id", input_schema: { type: "object" } },
+      { name: "headroom_retrieve", input_schema: { type: "object" } },
     ]).map((tool) => tool.name);
 
     assert.deepEqual(out, ["Read", "context7_resolve-library-id", "headroom_retrieve"]);
@@ -380,8 +391,10 @@ describe("tool schema selection", () => {
   it("orders output deterministically regardless of input order", () => {
     const names = (tools: unknown[]) =>
       getClaudeToolsForActiveOpenCodeTools(tools).map((tool) => tool.name);
-    const forward = names([{ name: "zeta_tool" }, { name: "bash" }, { name: "alpha_tool" }]);
-    const reverse = names([{ name: "alpha_tool" }, { name: "bash" }, { name: "zeta_tool" }]);
+    const zeta = { name: "zeta_tool", input_schema: { type: "object" } };
+    const alpha = { name: "alpha_tool", input_schema: { type: "object" } };
+    const forward = names([zeta, { name: "bash" }, alpha]);
+    const reverse = names([alpha, { name: "bash" }, zeta]);
 
     assert.deepEqual(forward, ["Bash", "alpha_tool", "zeta_tool"]);
     assert.deepEqual(forward, reverse);
@@ -389,11 +402,97 @@ describe("tool schema selection", () => {
 
   it("deduplicates repeated passthrough tools", () => {
     const out = getClaudeToolsForActiveOpenCodeTools([
-      { name: "compress" },
-      { name: "compress" },
+      { name: "compress", input_schema: { type: "object" } },
+      { name: "compress", input_schema: { type: "object" } },
     ]).map((tool) => tool.name);
 
     assert.deepEqual(out, ["compress"]);
+  });
+
+
+  it("preserves active MCP and custom OpenCode tools", () => {
+    const customTool = {
+      name: "custom_mcp_query_record",
+      description: "Get a record by ID",
+      input_schema: {
+        type: "object",
+        properties: { recordId: { type: "string" } },
+        required: ["recordId"],
+      },
+    };
+    const out = getClaudeToolsForActiveOpenCodeTools([
+      { name: "bash", description: "OpenCode bash", input_schema: { type: "object" } },
+      customTool,
+    ]);
+
+    const bashTool = out.find((tool) => tool.name === "Bash");
+    const preservedTool = out.find((tool) => tool.name === customTool.name);
+
+    assert.ok(bashTool);
+    assert.notEqual(bashTool.description, "OpenCode bash");
+    assert.deepEqual(preservedTool, customTool);
+  });
+
+  it("preserves MCP tools that have no description", () => {
+    const out = getClaudeToolsForActiveOpenCodeTools([
+      {
+        name: "custom_mcp_get_timestamp",
+        input_schema: { type: "object", properties: {} },
+      },
+    ]);
+
+    assert.deepEqual(out, [
+      {
+        name: "custom_mcp_get_timestamp",
+        description: "",
+        input_schema: { type: "object", properties: {} },
+      },
+    ]);
+  });
+
+  it("preserves MCP tools whose names look like prefixed core tools", () => {
+    const mcpTool = {
+      name: "mcp_bash",
+      description: "Run a command through an MCP server",
+      input_schema: {
+        type: "object",
+        properties: { command: { type: "string" } },
+        required: ["command"],
+      },
+    };
+    const out = getClaudeToolsForActiveOpenCodeTools([mcpTool]);
+
+    assert.deepEqual(out, [mcpTool]);
+  });
+
+  it("preserves custom tools whose names collide with Claude core tool names", () => {
+    const customTool = {
+      name: "Bash",
+      description: "Custom Bash-like MCP tool",
+      input_schema: {
+        type: "object",
+        properties: { script: { type: "string" } },
+        required: ["script"],
+      },
+    };
+    const out = getClaudeToolsForActiveOpenCodeTools([customTool]);
+
+    assert.deepEqual(out, [customTool]);
+  });
+
+  it("maps inbound Claude core names only for active OpenCode core tools", () => {
+    assert.deepEqual(getInboundToolNameMapForActiveOpenCodeTools([
+      { name: "bash" },
+      { name: "mcp_bash", input_schema: { type: "object" } },
+    ]), { Bash: "bash" });
+    assert.deepEqual(getInboundToolNameMapForActiveOpenCodeTools([
+      { name: "Bash", input_schema: { type: "object" } },
+    ]), {});
+  });
+
+  it("maps outbound OpenCode core history but preserves MCP-prefixed names", () => {
+    assert.equal(mapOutboundToolName("bash"), "Bash");
+    assert.equal(mapOutboundToolName("mcp_bash"), "mcp_bash");
   });
 
   it("does not advertise AskUserQuestion when OpenCode did not enable question", () => {
@@ -1304,5 +1403,19 @@ describe("failureSignature", () => {
 
   it("falls back to the raw body when it is not an error envelope", () => {
     assert.equal(failureSignature(403, "  <html>Forbidden</html> "), "403|<html>Forbidden</html>");
+  });
+});
+
+describe("plugin module shape", () => {
+  it("default-exports { id, server } so opencode's loader recognises it", () => {
+    // A bare function default export sends opencode down its legacy path, where
+    // it calls every named export of this module as a plugin factory — which
+    // crashes on the helpers above and takes the whole plugin down with it.
+    assert.equal(typeof pluginModule, "object");
+    assert.equal(typeof pluginModule.server, "function");
+  });
+
+  it("carries an id, which opencode requires for path-referenced plugins", () => {
+    assert.equal(pluginModule.id, "opencode-claude-bridge");
   });
 });
