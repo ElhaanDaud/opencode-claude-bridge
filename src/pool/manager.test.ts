@@ -5,7 +5,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import type { TestContext } from "node:test";
 
-import { createRotationManager, describeExhaustion } from "./manager.js";
+import { createRotationManager, describeExhaustion, formatWait } from "./manager.js";
 import { createRotationStateStore } from "./rotation-state.js";
 import { createAccountStore } from "./secret-store.js";
 import type {
@@ -58,6 +58,7 @@ interface Harness {
   accounts: ReturnType<typeof createAccountStore>;
   refreshCalls: string[];
   mirrored: PoolOAuthTokens[];
+  disabledEvents: string[];
   journalPath: string;
   statePath: string;
   setNow: (n: number) => void;
@@ -87,12 +88,16 @@ function harness(
 
   const refreshCalls: string[] = [];
   const mirrored: PoolOAuthTokens[] = [];
+  const disabledEvents: string[] = [];
 
   const manager = createRotationManager({
     accounts,
     state,
     clock,
     journalPath,
+    onAccountDisabled: (label) => {
+      disabledEvents.push(label);
+    },
     refreshFn: (token) => {
       refreshCalls.push(token);
       if (refreshImpl) return refreshImpl(token);
@@ -114,6 +119,7 @@ function harness(
     accounts,
     refreshCalls,
     mirrored,
+    disabledEvents,
     journalPath,
     statePath,
     setNow: (n) => {
@@ -522,18 +528,122 @@ describe("exhaustion messaging", () => {
       NOW,
     );
 
-    assert.match(message, /bob/);
-    assert.match(message, /alice/);
-    assert.match(message, /60m/);
-    assert.match(message, /re-authentication/i);
+    // Single line on purpose: opencode renders session errors as a 5s toast
+    // with a hardcoded duration, so anything longer is unreadable before it
+    // disappears. The full breakdown belongs in the dashboard.
+    assert.equal(message.split("\n").length, 1);
+    assert.ok(message.length <= 80, `message too long for a toast: ${message.length}`);
+    assert.match(message, /bob/, "names the account that frees up first");
+    assert.match(message, /60m|1h/, "states when it frees up");
   });
 
-  it("says recovery is impossible when every account is disabled", () => {
+  it("points at re-enrollment when every account is disabled", () => {
     const message = describeExhaustion(
       { earliestReset: null, cooling: [], disabled: ["alice", "bob"] },
       NOW,
     );
 
-    assert.match(message, /no account will recover automatically/i);
+    assert.equal(message.split("\n").length, 1);
+    assert.match(message, /2 accounts disabled/i);
+    assert.match(message, /re-enroll|re-login/i);
+  });
+
+  it("keeps the minutes instead of rounding down to whole hours", () => {
+    const message = describeExhaustion(
+      { earliestReset: NOW + 119 * 60_000, cooling: [{ label: "bob", until: NOW + 119 * 60_000 }], disabled: [] },
+      NOW,
+    );
+    assert.match(message, /1h 59m \(bob\)$/);
+  });
+
+  it("mentions disabled accounts alongside the cooling one", () => {
+    const message = describeExhaustion(
+      { earliestReset: NOW + 60_000, cooling: [{ label: "bob", until: NOW + 60_000 }], disabled: ["alice"] },
+      NOW,
+    );
+    assert.match(message, /1m \(bob\); 1 disabled$/);
+  });
+
+  it("names a single disabled account and how to bring it back, within toast length", () => {
+    const message = describeExhaustion({ earliestReset: null, cooling: [], disabled: ["alice"] }, NOW);
+    assert.match(message, /"alice" disabled/);
+    assert.match(message, /claude-pool enroll/);
+    assert.ok(message.length <= 80, `message too long for a toast: ${message.length}`);
+  });
+
+  it("does not blame disabled accounts when none are disabled or cooling", () => {
+    const message = describeExhaustion({ earliestReset: null, cooling: [], disabled: [] }, NOW);
+    assert.doesNotMatch(message, /disabled|re-login/);
+  });
+});
+
+describe("formatWait", () => {
+  it("renders minutes, hours and days", () => {
+    assert.equal(formatWait(0), "0m");
+    assert.equal(formatWait(45 * 60_000), "45m");
+    assert.equal(formatWait(60 * 60_000), "1h");
+    assert.equal(formatWait(119 * 60_000), "1h 59m");
+    assert.equal(formatWait(51 * 3_600_000), "2d 3h");
+    assert.equal(formatWait(48 * 3_600_000), "2d");
+  });
+});
+
+describe("disabled-account notification", () => {
+  it("reports a credential missing from the keychain", async (t) => {
+    const h = harness(t, [record("alice")]);
+    await h.state.ensureAccount("ghost");
+    await h.state.setActive("ghost");
+
+    const result = await h.manager.acquire();
+
+    assert.equal(result.kind === "ok" && result.label, "alice");
+    assert.deepEqual(h.disabledEvents, ["ghost"]);
+  });
+
+  it("reports a rejected refresh but not a transient one", async (t) => {
+    const rejected = harness(t, [record("alice", { expires: NOW - 1 })], () => {
+      throw new Error("Token refresh failed (400): invalid_grant");
+    });
+    await rejected.manager.acquire();
+    assert.deepEqual(rejected.disabledEvents, ["alice"]);
+
+    const transient = harness(t, [record("alice", { expires: NOW - 1 })], () => {
+      throw new Error("Token endpoint unreachable: request timed out");
+    });
+    await transient.manager.acquire();
+    assert.deepEqual(transient.disabledEvents, []);
+  });
+
+  it("reports a ROTATE_DISABLE decision", async (t) => {
+    const h = harness(t, [record("alice")]);
+    await h.manager.applyDecision("alice", {
+      action: "ROTATE_DISABLE",
+      reason: "revoked",
+      source: "status",
+    });
+    assert.deepEqual(h.disabledEvents, ["alice"]);
+  });
+
+  it("still disables the account when the listener throws", async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pool-manager-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const state = createRotationStateStore({ path: path.join(root, "state.json"), lockPollMs: 1 });
+    const manager = createRotationManager({
+      accounts: createAccountStore(memoryBackend({ alice: JSON.stringify(record("alice")) })),
+      state,
+      clock: () => NOW,
+      journalPath: path.join(root, "journal.json"),
+      refreshFn: () => {
+        throw new Error("unused");
+      },
+      mirrorFn: async () => {},
+      onAccountDisabled: () => {
+        throw new Error("toast failed");
+      },
+    });
+
+    await manager.applyDecision("alice", { action: "ROTATE_DISABLE", reason: "revoked", source: "status" });
+
+    assert.equal(state.load().accounts.alice?.disabled, true);
   });
 });

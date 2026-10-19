@@ -72,6 +72,8 @@ export interface ManagerOptions {
   journalPath?: string;
   /** Refresh when the access token expires within this window. */
   expiryBufferMs?: number;
+  /** Called after an account is disabled. Must not throw; errors are swallowed. */
+  onAccountDisabled?: (label: string, reason: string) => void;
 }
 
 interface JournalEntry {
@@ -120,35 +122,42 @@ export function defaultJournalPath(): string {
   );
 }
 
-/** Human-readable fail-fast message naming who is cold and when they return. */
+/**
+ * One-line fail-fast message.
+ *
+ * Deliberately terse: opencode renders session errors as a 5-second toast over
+ * the prompt area, with the duration hardcoded at its call site, so a
+ * multi-sentence message is unreadable before it vanishes. The per-account
+ * breakdown lives in `claude-pool dashboard`, which is where someone can
+ * actually study it.
+ */
 export function describeExhaustion(info: ExhaustionInfo, now: number): string {
-  const parts: string[] = ["All Claude accounts in the pool are unavailable."];
-
-  if (info.cooling.length > 0) {
-    const list = info.cooling
-      .map((c) => {
-        const mins = Math.max(0, Math.ceil((c.until - now) / 60_000));
-        return `${c.label} (available in ~${mins}m, at ${new Date(c.until).toISOString()})`;
-      })
-      .join(", ");
-    parts.push(`Cooling down: ${list}.`);
-  }
-
-  if (info.disabled.length > 0) {
-    parts.push(
-      `Disabled (needs re-authentication): ${info.disabled.join(", ")}.`,
-    );
-  }
-
+  const disabled = info.disabled.length;
   if (info.earliestReset !== null) {
-    parts.push(
-      `Earliest availability: ${new Date(info.earliestReset).toISOString()}.`,
+    const soonest = info.cooling.reduce<{ label: string; until: number } | null>(
+      (best, candidate) => (best === null || candidate.until < best.until ? candidate : best),
+      null,
     );
-  } else {
-    parts.push("No account will recover automatically; re-enroll or re-login.");
+    const who = soonest ? ` (${soonest.label})` : "";
+    const alsoDisabled = disabled > 0 ? `; ${disabled} disabled` : "";
+    return `Claude pool exhausted — next account free in ${formatWait(info.earliestReset - now)}${who}${alsoDisabled}`;
   }
+  if (disabled === 0) {
+    // Reachable when this request tried every account but none is cooling or disabled.
+    return "Claude pool exhausted — every account failed this request";
+  }
+  if (disabled === 1) {
+    return `Claude pool exhausted — "${info.disabled[0]}" disabled; re-login, then claude-pool enroll`;
+  }
+  return `Claude pool exhausted — ${disabled} accounts disabled; re-login and re-enroll each`;
+}
 
-  return parts.join(" ");
+export function formatWait(ms: number): string {
+  const mins = Math.max(0, Math.ceil(ms / 60_000));
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return mins % 60 ? `${hours}h ${mins % 60}m` : `${hours}h`;
+  return hours % 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h` : `${Math.floor(hours / 24)}d`;
 }
 
 export function createRotationManager(opts: ManagerOptions) {
@@ -156,6 +165,15 @@ export function createRotationManager(opts: ManagerOptions) {
   const clock: Clock = opts.clock ?? (() => Date.now());
   const journalPath = opts.journalPath ?? defaultJournalPath();
   const expiryBufferMs = opts.expiryBufferMs ?? 60_000;
+
+  async function disable(label: string, reason: string): Promise<void> {
+    await state.markDisabled(label, reason);
+    try {
+      opts.onAccountDisabled?.(label, reason);
+    } catch {
+      // A notification failure must not undo or abort the state change.
+    }
+  }
 
   /** Collapses concurrent in-process refreshes of the same account. */
   const inFlight = new Map<string, Promise<PoolOAuthTokens>>();
@@ -332,7 +350,7 @@ export function createRotationManager(opts: ManagerOptions) {
     if (!record) {
       // Enrolled in state but missing from the keychain: disable rather than
       // spin, so selection moves on instead of picking it again.
-      await state.markDisabled(label, "credentials missing from keychain");
+      await disable(label, "credentials missing from keychain");
       return acquire(exclude);
     }
 
@@ -348,7 +366,7 @@ export function createRotationManager(opts: ManagerOptions) {
           // instead, or one transient outage disables every account in turn and
           // wedges the pool with no automatic recovery.
           if (isCredentialRejected(detail)) {
-            await state.markDisabled(label, `refresh rejected: ${detail}`);
+            await disable(label, `refresh rejected: ${detail}`);
           } else {
             await state.markCooldown(
               label,
@@ -411,7 +429,7 @@ export function createRotationManager(opts: ManagerOptions) {
         await releaseIfActive();
         break;
       case "ROTATE_DISABLE":
-        await state.markDisabled(label, decision.reason);
+        await disable(label, decision.reason);
         await releaseIfActive();
         break;
       case "RETRY_SAME":

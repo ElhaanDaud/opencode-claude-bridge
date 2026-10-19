@@ -206,11 +206,14 @@ async function s4() {
 
   const msg = body?.error?.message ?? "";
   const labels = Object.keys(state.load().accounts);
-  const namesBoth = labels.length > 0 && labels.every((l) => msg.includes(l));
+  // One line naming the account that frees up first: opencode shows this as a
+  // 5-second toast, so the full per-account breakdown lives in the dashboard.
+  const namesAnAccount = labels.some((l) => msg.includes(l));
+  const oneLine = msg.length > 0 && !msg.includes("\n");
   record(
     "S4 full exhaustion fails fast",
-    res.status === 429 && namesBoth && Number(retryAfter) > 0,
-    `HTTP ${res.status} retry-after=${retryAfter} | namesBothAccounts=${namesBoth} | msg: ${msg.slice(0, 200)}`,
+    res.status === 429 && namesAnAccount && oneLine && Number(retryAfter) > 0,
+    `HTTP ${res.status} retry-after=${retryAfter} | namesAnAccount=${namesAnAccount} oneLine=${oneLine} | msg: ${msg.slice(0, 200)}`,
   );
 }
 

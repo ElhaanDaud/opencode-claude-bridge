@@ -2,7 +2,7 @@ import { refreshTokens } from "../oauth.js";
 import { createRotationManager } from "./manager.js";
 import { createRotationStateStore, defaultLockPath, defaultStatePath } from "./rotation-state.js";
 import { createAccountStore, createSecretBackend } from "./secret-store.js";
-import type { RotationManager } from "./manager.js";
+import type { ManagerOptions, RotationManager } from "./manager.js";
 import type { PoolOAuthTokens } from "./types.js";
 
 export interface PoolClient {
@@ -14,13 +14,17 @@ export interface PoolClient {
   };
 }
 
-export function createPool(client: PoolClient): RotationManager {
+export function createPool(
+  client: PoolClient,
+  hooks: Pick<ManagerOptions, "onAccountDisabled"> = {},
+): RotationManager {
   const accounts = createAccountStore(createSecretBackend());
   const state = createRotationStateStore({ path: defaultStatePath(), lockPath: defaultLockPath() });
 
   return createRotationManager({
     accounts,
     state,
+    onAccountDisabled: hooks.onAccountDisabled,
     refreshFn: (refreshToken) => refreshTokens(refreshToken),
     mirrorFn: async (tokens: PoolOAuthTokens) => {
       await client.auth.set({

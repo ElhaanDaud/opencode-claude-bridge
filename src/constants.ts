@@ -136,3 +136,6 @@ export const SESSION_ID =
   process.env.ANTHROPIC_SESSION_ID || "";
 
 export const TOOL_PREFIX = "mcp_";
+
+// Long enough to read a per-account recovery time; the toast clears itself.
+export const POOL_TOAST_DURATION_MS = 10_000;
