@@ -7,6 +7,24 @@ Use your Claude Pro/Max subscription in [OpenCode](https://opencode.ai). If you'
 This fork is installed from source. The `opencode-claude-bridge` package on
 npm is the upstream project and does not include the account pool.
 
+### Install with AI
+
+Copy this one line into your AI coding agent (OpenCode, Claude Code, Cursor and so on):
+
+```
+Follow the instructions at https://raw.githubusercontent.com/ElhaanDaud/opencode-claude-pool/main/INSTALL-AI.md to install opencode-claude-pool on this machine.
+```
+
+The agent checks your OpenCode version and installs the matching build: `main`
+for OpenCode 1, `feat/opencode-2` for OpenCode 2. It edits your OpenCode config
+in place after backing it up. Logging accounts in (`claude login`) stays with
+you, because each login is interactive. The full instructions it follows are in
+[INSTALL-AI.md](INSTALL-AI.md).
+
+### OpenCode 1 (manual)
+
+Check your version with `opencode --version`. For `1.x`:
+
 **1. Clone and build**
 
 ```bash
@@ -43,6 +61,48 @@ cd ~/src/opencode-claude-bridge && git pull && npm ci && npm run build
 ```
 
 Then restart OpenCode. Full walkthrough, Linux notes and troubleshooting: [SETUP.md](SETUP.md).
+
+### OpenCode 2 (manual)
+
+OpenCode 2 has a new plugin API and cannot load the V1 plugin. Its support
+lives on the `feat/opencode-2` branch for now. For `opencode --version` `2.x`:
+
+**1. Clone the V2 branch and build**
+
+```bash
+git clone -b feat/opencode-2 https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
+cd ~/src/opencode-claude-bridge && npm ci && npm run build
+```
+
+If you already have a checkout of `main`, switch it instead:
+`git checkout feat/opencode-2 && git pull && npm ci && npm run build`.
+
+**2. Register the build directory** in `~/.config/opencode/opencode.json`. V2
+uses the `plugins` key (plural) and only loads a local plugin from a directory,
+so no wrapper is needed:
+
+```json
+{
+  "plugins": ["file:///Users/YOU/src/opencode-claude-bridge/dist/opencode2"]
+}
+```
+
+V1 and V2 read the same config file. Don't keep a V1 `plugin` entry for the
+wrapper there: V2 migrates it and fails to load it.
+
+**3. Restart OpenCode and check** that `opencode plugin list` shows
+`opencode-claude-bridge` with a source ending in `dist/opencode2/server.js`.
+
+Enrollment, `claude-pool` and the pool itself are shared with V1, so
+[Multi-account rotation](#multi-account-rotation) applies unchanged. What
+differs on V2:
+
+- Tool schemas are sent as V2 defines them. The Claude Code tool mapping is not applied yet.
+- Pool events are logged rather than shown as toasts, since V2's plugin API has no toast call.
+- Without enrolled accounts it uses the Claude CLI login as-is and never refreshes it. Run `claude` to refresh it, or enroll the account.
+- An Anthropic API key you configure in V2 itself takes precedence, and the bridge leaves those requests alone.
+
+**Upgrade:** `cd ~/src/opencode-claude-bridge && git pull && npm ci && npm run build`, then restart OpenCode.
 
 ## How the bridge works
 
@@ -293,7 +353,7 @@ CLI's own stored copy of that credential is stale.** That is expected. Run
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1.2+
+- [OpenCode](https://opencode.ai) v1.2+, or v2 via the `feat/opencode-2` branch (tested on 2.0.32; see [OpenCode 2](#opencode-2-manual))
 - For OAuth: [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in (`claude login`)
 - macOS (Keychain) or Linux (`~/.claude/.credentials.json` fallback)
 - For API key: just configure a `provider` with `apiKey` in your OpenCode config as usual
