@@ -6,9 +6,9 @@ import type {
   Clock,
 } from "./types.js";
 import type { AccountStore } from "./manager.js";
+import { PROFILE_URL } from "../constants.js";
 
 const CLAUDE_CLI_KEYCHAIN_SERVICE = "Claude Code-credentials";
-const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 const OAUTH_BETA = "oauth-2025-04-20";
 
 export class EnrollmentError extends Error {}

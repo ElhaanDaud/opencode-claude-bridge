@@ -12,7 +12,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { CLI_VERSION } from "./constants.js";
+import { getCliVersion } from "./constants.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -37,7 +37,7 @@ const FINGERPRINT_SALT = "59cf53e54c78";
  */
 export function computeFingerprint(
   firstUserMessageText: string,
-  version: string = CLI_VERSION,
+  version: string = getCliVersion(),
 ): string {
   const indices = [4, 7, 20];
   const chars = indices.map((i) => firstUserMessageText[i] || "0").join("");

@@ -1,37 +1,72 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+const CLAUDE_BINARIES = [
+  "claude",
+  join(homedir(), ".local", "bin", "claude"),
+  join(homedir(), ".claude", "local", "claude"),
+];
+const FALLBACK_CLI_VERSION = "2.1.98";
+const VERSION_RECHECK_MS = 10 * 60_000;
+
+function parseVersion(output: string): string | null {
+  return output.trim().match(/^(\d+\.\d+\.\d+)/)?.[1] ?? null;
+}
+
 function detectClaudeVersion(): string {
-  // Try to read version from installed Claude CLI
-  try {
-    const version = execFileSync("claude", ["--version"], {
-      encoding: "utf8",
-      timeout: 3000,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    const match = version.match(/^(\d+\.\d+\.\d+)/);
-    if (match) return match[1];
-  } catch {}
-  // Fallback to credentials file
+  for (const binary of CLAUDE_BINARIES) {
+    try {
+      const version = parseVersion(execFileSync(binary, ["--version"], {
+        encoding: "utf8",
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"],
+      }));
+      if (version) return version;
+    } catch {}
+  }
   try {
     const credPath = join(homedir(), ".claude", ".credentials.json");
-    const raw = readFileSync(credPath, "utf8");
-    const parsed = JSON.parse(raw);
+    const parsed = JSON.parse(readFileSync(credPath, "utf8"));
     if (parsed.version && typeof parsed.version === "string") {
       return parsed.version;
     }
   } catch {}
-  return "2.1.98";
+  console.error(
+    `[opencode-claude-bridge] Claude Code CLI not found; advertising version ${FALLBACK_CLI_VERSION}, which newer models reject. Set ANTHROPIC_CLI_VERSION to override.`,
+  );
+  return FALLBACK_CLI_VERSION;
+}
+
+let cliVersion = process.env.ANTHROPIC_CLI_VERSION || detectClaudeVersion();
+let versionCheckedAt = Date.now();
+
+function recheckVersionInBackground(index = 0): void {
+  if (index >= CLAUDE_BINARIES.length) return;
+  execFile(CLAUDE_BINARIES[index]!, ["--version"], { encoding: "utf8", timeout: 3000 }, (err, stdout) => {
+    const version = err ? null : parseVersion(stdout);
+    if (version) cliVersion = version;
+    else recheckVersionInBackground(index + 1);
+  });
+}
+
+// Not a const: Claude Code auto-updates under us and the API gates models on this.
+export function getCliVersion(): string {
+  if (!process.env.ANTHROPIC_CLI_VERSION && Date.now() - versionCheckedAt > VERSION_RECHECK_MS) {
+    versionCheckedAt = Date.now();
+    recheckVersionInBackground();
+  }
+  return cliVersion;
 }
 
 export const CLIENT_ID =
   process.env.ANTHROPIC_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
+// claude.ai serves this path behind a Cloudflare challenge that always 403s.
 export const PROFILE_URL =
   process.env.ANTHROPIC_PROFILE_URL ||
-  "https://claude.ai/api/oauth/profile";
+  "https://api.anthropic.com/api/oauth/profile";
 
 export const TOKEN_URL =
   process.env.ANTHROPIC_TOKEN_URL ||
@@ -54,9 +89,6 @@ export const SCOPES =
   process.env.ANTHROPIC_SCOPES ||
   "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
-export const CLI_VERSION =
-  process.env.ANTHROPIC_CLI_VERSION || detectClaudeVersion();
-
 export const CLI_BUILD_ID =
   process.env.ANTHROPIC_CLI_BUILD_ID || "835";
 
@@ -65,9 +97,10 @@ export const ENTRYPOINT =
   process.env.CLAUDE_CODE_ENTRYPOINT ||
   "sdk-cli";
 
-export const USER_AGENT =
-  process.env.ANTHROPIC_USER_AGENT ||
-  `claude-cli/${CLI_VERSION} (external, ${ENTRYPOINT})`;
+export function getUserAgent(): string {
+  return process.env.ANTHROPIC_USER_AGENT ||
+    `claude-cli/${getCliVersion()} (external, ${ENTRYPOINT})`;
+}
 
 // Exact beta flags from Claude Code 2.1.178 (confirmed via request interception)
 // oauth-2025-04-20 is added separately only for OAuth auth.

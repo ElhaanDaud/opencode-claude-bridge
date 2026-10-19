@@ -13,12 +13,12 @@ import {
 import { getClaudeTokens, readClaudeCredentials } from "./keychain.js";
 import {
   BETA_FLAGS,
-  CLI_VERSION,
+  getCliVersion,
   OAUTH_BETA_FLAG,
   ANTHROPIC_VERSION,
   BILLING_CCH,
   STAINLESS_HEADERS,
-  USER_AGENT,
+  getUserAgent,
   PROFILE_URL,
   CLI_BUILD_ID,
   ENTRYPOINT,
@@ -499,11 +499,13 @@ function mergeHeaders(target: Headers, source: HeadersInit) {
 
 /** Build deduplicated beta flags string. */
 function buildBetaFlags(existing: string): string {
-  const required = BETA_FLAGS.split(",").map((b) => b.trim()).filter(Boolean);
-  const withoutSpecials = required.filter(
+  // Dropping caller flags makes the API reject newer body fields they gate.
+  const split = (s: string) => s.split(",").map((b) => b.trim()).filter(Boolean);
+  const merged = [...split(BETA_FLAGS), ...split(existing)];
+  const withoutSpecials = merged.filter(
     (beta) => beta !== "claude-code-20250219" && beta !== OAUTH_BETA_FLAG,
   );
-  return ["claude-code-20250219", OAUTH_BETA_FLAG, ...withoutSpecials].join(",");
+  return [...new Set(["claude-code-20250219", OAUTH_BETA_FLAG, ...withoutSpecials])].join(",");
 }
 
 /** Deduplicate repeated Claude Code prefix in a text block. */
@@ -615,8 +617,8 @@ function buildBillingHeader(
   const suffix = dynamicFingerprint
     || cachedClaudePromptCache?.billing?.ccVersionSuffix
     || CLI_BUILD_ID;
-  const ccVersion = cachedClaudePromptCache?.billing?.ccVersion
-    || `${CLI_VERSION}.${suffix}`;
+  // Deliberately ignores the capture: the API gates model access on this.
+  const ccVersion = `${getCliVersion()}.${suffix}`;
   const ccEntrypoint = cachedClaudePromptCache?.billing?.ccEntrypoint || ENTRYPOINT;
   return `x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=${ccEntrypoint}; cch=${cch};`;
 }
@@ -631,7 +633,7 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
         headers: {
           authorization: `Bearer ${accessToken}`,
           "content-type": "application/json",
-          "user-agent": USER_AGENT,
+          "user-agent": getUserAgent(),
           "anthropic-beta": OAUTH_BETA_FLAG,
         },
       });
@@ -643,6 +645,9 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
   })();
 
   oauthProfileCache.set(accessToken, pending);
+  void pending.then((profile) => {
+    if (!profile) oauthProfileCache.delete(accessToken);
+  });
   return pending;
 }
 
@@ -818,7 +823,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             headers.delete("x-session-affinity");
             headers.delete("x-session-id");
             if (!headers.has("accept")) headers.set("accept", "application/json");
-            headers.set("user-agent", USER_AGENT);
+            headers.set("user-agent", getUserAgent());
             headers.set("x-app", "cli");
             headers.set("x-claude-code-session-id", sessionId);
             headers.set("anthropic-version", ANTHROPIC_VERSION);
@@ -829,6 +834,17 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             headers.set("anthropic-beta", buildBetaFlags(headers.get("anthropic-beta") || ""));
 
             // ── Body ──
+            const userIdFor = async (token: string): Promise<string | undefined> => {
+              const profile = await fetchOAuthProfile(token);
+              if (!profile?.account?.uuid) return undefined;
+              return JSON.stringify({
+                device_id: deviceId,
+                account_uuid: profile.account.uuid,
+                session_id: sessionId,
+              });
+            };
+            let ownsUserId = false;
+
             let body = init?.body;
             if (body && typeof body === "string") {
               try {
@@ -878,16 +894,11 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
                 normalizeThinkingForSonnet55(parsed);
 
-                const profile = auth.access
-                  ? await fetchOAuthProfile(auth.access)
-                  : null;
                 if (!parsed.metadata) parsed.metadata = {};
-                if (!parsed.metadata.user_id && profile?.account?.uuid) {
-                  parsed.metadata.user_id = JSON.stringify({
-                    device_id: deviceId,
-                    account_uuid: profile.account.uuid,
-                    session_id: sessionId,
-                  });
+                if (!parsed.metadata.user_id) {
+                  ownsUserId = true;
+                  const userId = await userIdFor(accessToken);
+                  if (userId) parsed.metadata.user_id = userId;
                 }
 
                 // Compute dynamic fingerprint from the first user message
@@ -973,7 +984,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 body = JSON.stringify(parsed);
-              } catch {}
+              } catch {
+                ownsUserId = false;
+              }
             }
 
             // ── URL: add ?beta=true ──
@@ -1084,6 +1097,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
                 activeLabel = next.label;
                 outHeaders["authorization"] = `Bearer ${next.accessToken}`;
+                if (ownsUserId && typeof body === "string") {
+                  const rebound = JSON.parse(body);
+                  const userId = await userIdFor(next.accessToken);
+                  rebound.metadata ??= {};
+                  if (userId) rebound.metadata.user_id = userId;
+                  else delete rebound.metadata.user_id;
+                  body = JSON.stringify(rebound);
+                }
                 attempt = 0;
                 console.error(`[claude-pool] now using account "${activeLabel}"`);
                 response = await doFetch();

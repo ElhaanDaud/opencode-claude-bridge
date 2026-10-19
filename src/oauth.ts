@@ -7,7 +7,7 @@ import {
   AUTHORIZE_URL,
   MANUAL_REDIRECT_URL,
   SCOPES,
-  USER_AGENT,
+  getUserAgent,
 } from "./constants.js";
 
 export interface OAuthTokens {
@@ -53,7 +53,7 @@ export function buildTokenCurlArgs(): string[] {
     "-H",
     "Content-Type: application/json",
     "-H",
-    `User-Agent: ${USER_AGENT}`,
+    `User-Agent: ${getUserAgent()}`,
     "--data-binary",
     "@-",
   ];
