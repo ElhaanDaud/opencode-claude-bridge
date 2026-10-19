@@ -197,6 +197,7 @@ pooled account refreshes its entry instead of duplicating it. Set
 | `claude-pool whoami` | Show which account Claude CLI is logged into, and whether it is pooled |
 | `claude-pool list` | Every enrolled account with its status and token expiry |
 | `claude-pool status` | Active account and what rotation would pick next |
+| `claude-pool dashboard` | Interactive manager (prints the status when not in a terminal) |
 | `claude-pool remove <label>` | Drop an account |
 | `claude-pool clear-cooldowns` | Re-enable everything after a rate-limit storm |
 

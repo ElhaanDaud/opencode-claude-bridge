@@ -215,6 +215,53 @@ async function clearCooldowns() {
   console.log("Cleared all cooldowns and re-enabled every account.");
 }
 
+/** Interactive manager; prints the static dashboard when not attached to a terminal. */
+async function dashboard() {
+  const { createPool } = await import("../dist/pool/bridge.js");
+  const { createPoolTui } = await import("../dist/pool/tui.js");
+  const { fetchUsage } = await import("../dist/pool/usage.js");
+
+  // The TUI never writes to opencode's auth slot: mirroring is the plugin's job
+  // and doing it here would fight with a running opencode session.
+  const pool = createPool({ auth: { set: async () => {} } });
+
+  const tui = createPoolTui({
+    pool,
+    accounts,
+    state,
+    enroll: async (label, options) => {
+      const record = await enrollFromClaudeCli({
+        accounts,
+        label,
+        resolveEmail: true,
+        replace: options?.replace === true,
+      });
+      await state.resetHealth(record.label);
+      return record.label;
+    },
+    fetchUsage: async (label, allowRefresh) => {
+      let record = await accounts.getAccount(label);
+      if (!record) throw new Error(`account "${label}" is not enrolled`);
+      // A cooling account's ACCESS token is usually long expired while its
+      // refresh token is still good. Refreshing rotates the refresh token, so
+      // it only happens when the user explicitly asks (s), never as a side
+      // effect of moving the cursor over a row.
+      if (record.oauth.expires <= Date.now() + 60_000) {
+        if (!allowRefresh) throw new Error("access token expired");
+        await pool.refreshLabel(label);
+        record = await accounts.getAccount(label);
+        if (!record) throw new Error(`account "${label}" disappeared during refresh`);
+      }
+      return fetchUsage(record.oauth.access);
+    },
+    whoami: async () => {
+      const creds = parseClaudeCredentials(readClaudeCliCredentialsRaw());
+      return (await lookupEmail(creds.claudeAiOauth.accessToken)) ?? null;
+    },
+  });
+  await tui.start();
+}
+
 const [command, ...rest] = process.argv.slice(2);
 const flags = rest.filter((a) => a.startsWith("--"));
 const arg = rest.find((a) => !a.startsWith("--"));
@@ -223,6 +270,7 @@ try {
     case "enroll": await enroll(arg, flags); break;
     case "list": await list(); break;
     case "status": await status(); break;
+    case "dashboard": await dashboard(); break;
     case "whoami": await whoami(); break;
     case "auto": await auto(); break;
     case "install-hook": await installHook(); break;
@@ -239,6 +287,7 @@ try {
         "  whoami                      show which account Claude CLI is logged into",
         "  list                        show every enrolled account and its status",
         "  status                      show active account and what rotation picks next",
+        "  dashboard                   interactive manager (prints the status when not in a terminal)",
         "  remove <label>              drop an account from the pool",
         "  clear-cooldowns             re-enable everything after a rate-limit storm",
         "",

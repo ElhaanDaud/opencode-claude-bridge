@@ -406,6 +406,7 @@ export function createRotationManager(opts: ManagerOptions) {
           label,
           decision.until ?? clock(),
           decision.reason,
+          decision.windows,
         );
         await releaseIfActive();
         break;
@@ -419,9 +420,61 @@ export function createRotationManager(opts: ManagerOptions) {
     }
   }
 
+  /**
+   * Read-only view of every enrolled account for the dashboard. Deliberately
+   * returns no secret material — only the token EXPIRY, never the token.
+   */
+  async function snapshot(): Promise<PoolSnapshot> {
+    await sync();
+    const now = clock();
+    const rotation = state.load();
+    const records = await accounts.listAccounts();
+    const rows: PoolSnapshotRow[] = records.map((record) => {
+      const account = rotation.accounts[record.label];
+      const cooling =
+        account?.cooldownUntil !== null &&
+        account?.cooldownUntil !== undefined &&
+        account.cooldownUntil > now;
+      return {
+        label: record.label,
+        email: record.email ?? null,
+        tier: record.subscriptionType ?? null,
+        status: account?.disabled ? "disabled" : cooling ? "cooling" : "ready",
+        cooldownUntil: cooling ? (account!.cooldownUntil as number) : null,
+        reason: account?.lastReason ?? null,
+        failureCount: account?.failureCount ?? 0,
+        tokenExpires: record.oauth.expires,
+        active: rotation.activeLabel === record.label,
+        fiveHourReset: account?.fiveHourReset ?? null,
+        sevenDayReset: account?.sevenDayReset ?? null,
+        bindingWindow: account?.bindingWindow ?? null,
+        scopes: record.scopes ?? null,
+        rateLimitTier: record.rateLimitTier ?? null,
+        enrolledAt: record.enrolledAt,
+        updatedAt: account?.updatedAt ?? null,
+      };
+    });
+    rows.sort((left, right) => {
+      const rank = { ready: 0, cooling: 1, disabled: 2 } as const;
+      return rank[left.status] - rank[right.status] || (left.label < right.label ? -1 : 1);
+    });
+    return { activeLabel: rotation.activeLabel, now, accounts: rows };
+  }
+
+  /**
+   * True when a refresh journal is present, i.e. a previous process died
+   * between minting new tokens and persisting them. Surfaced so the recovery
+   * path is visible rather than silent.
+   */
+  function pendingRefreshLabel(): string | null {
+    return readJournal()?.label ?? null;
+  }
+
   return {
     isActive,
     sync,
+    snapshot,
+    pendingRefreshLabel,
     acquire,
     refreshLabel,
     applyDecision,
@@ -453,6 +506,31 @@ export function createRotationManager(opts: ManagerOptions) {
       return describeExhaustion(info, clock());
     },
   };
+}
+
+export interface PoolSnapshotRow {
+  label: string;
+  email: string | null;
+  tier: string | null;
+  status: "ready" | "cooling" | "disabled";
+  cooldownUntil: number | null;
+  reason: string | null;
+  failureCount: number;
+  tokenExpires: number;
+  active: boolean;
+  fiveHourReset: number | null;
+  sevenDayReset: number | null;
+  bindingWindow: "five_hour" | "seven_day" | null;
+  scopes: string[] | null;
+  rateLimitTier: string | null;
+  enrolledAt: number;
+  updatedAt: number | null;
+}
+
+export interface PoolSnapshot {
+  activeLabel: string | null;
+  now: number;
+  accounts: PoolSnapshotRow[];
 }
 
 export type RotationManager = ReturnType<typeof createRotationManager>;

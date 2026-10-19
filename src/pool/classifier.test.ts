@@ -178,3 +178,28 @@ describe("classify", () => {
     assert.equal(decision.source, "body-hint");
   });
 });
+
+describe("usage window hints", () => {
+  it("leaves the binding window unknown when the claim header is absent", () => {
+    const decision = classify(input({
+      headers: { "retry-after": "3600", "anthropic-ratelimit-unified-5h-reset": "1800" },
+      now: NOW,
+    }));
+
+    assert.equal(decision.windows?.fiveHourReset, NOW + 1_800_000);
+    assert.equal(decision.windows?.binding, undefined);
+  });
+
+  it("records the binding window when the claim header names it", () => {
+    const decision = classify(input({
+      headers: {
+        "retry-after": "3600",
+        "anthropic-ratelimit-unified-5h-reset": "1800",
+        "anthropic-ratelimit-unified-representative-claim": "five_hour",
+      },
+      now: NOW,
+    }));
+
+    assert.equal(decision.windows?.binding, "five_hour");
+  });
+});

@@ -371,12 +371,26 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       });
     },
 
-    async markCooldown(label: string, until: number, reason: string): Promise<void> {
+    async markCooldown(
+      label: string,
+      until: number,
+      reason: string,
+      windows?: {
+        fiveHourReset?: number | null;
+        sevenDayReset?: number | null;
+        binding?: "five_hour" | "seven_day" | null;
+      },
+    ): Promise<void> {
       await mutateAccount(label, (account, now) => {
         account.cooldownUntil = until;
         account.failureCount += 1;
         account.lastReason = reason;
         account.updatedAt = now;
+        // Only overwrite a window we actually observed; a 429 that disclosed
+        // one window must not erase what we already know about the other.
+        if (windows?.fiveHourReset != null) account.fiveHourReset = windows.fiveHourReset;
+        if (windows?.sevenDayReset != null) account.sevenDayReset = windows.sevenDayReset;
+        if (windows?.binding !== undefined) account.bindingWindow = windows.binding;
       });
     },
 
@@ -395,6 +409,15 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
         account.failureCount = 0;
         account.lastReason = null;
         account.updatedAt = now;
+        // Observed quota windows are left intact: clearing local health does
+        // not give the account its server-side quota back.
+      });
+    },
+
+    async forget(label: string): Promise<void> {
+      await withLock((state) => {
+        delete state.accounts[label];
+        if (state.activeLabel === label) state.activeLabel = null;
       });
     },
 

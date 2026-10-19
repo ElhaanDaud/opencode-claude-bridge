@@ -86,6 +86,15 @@ export interface AccountState {
   lastReason: string | null;
   /** Epoch ms of the last mutation. */
   updatedAt: number;
+  /**
+   * Last observed reset times for Anthropic's two subscription windows, in
+   * epoch ms. Captured from rate-limit headers so the UI can show remaining
+   * quota instead of only "cooling until X". `undefined` = never observed.
+   */
+  fiveHourReset?: number | null;
+  sevenDayReset?: number | null;
+  /** Which window Anthropic named as binding on the last 429. */
+  bindingWindow?: "five_hour" | "seven_day" | null;
 }
 
 export interface RotationState {
@@ -138,6 +147,15 @@ export interface RotationDecision {
   /** Human-readable justification, surfaced in logs and error responses. */
   reason: string;
   source: DecisionSource;
+  /**
+   * Both subscription windows when the response disclosed them, epoch ms.
+   * Recorded for display; rotation itself only needs `until`.
+   */
+  windows?: {
+    fiveHourReset?: number | null;
+    sevenDayReset?: number | null;
+    binding?: "five_hour" | "seven_day" | null;
+  };
 }
 
 /** Input to the pure classifier. `headers` keys MUST be lowercased by the caller. */

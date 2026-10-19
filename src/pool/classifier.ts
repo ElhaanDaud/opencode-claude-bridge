@@ -279,6 +279,36 @@ function decisionFromReset(
   };
 }
 
+/**
+ * Capture BOTH subscription windows when present, independently of which one
+ * is binding. Purely informational — rotation keys off `until`.
+ */
+function resolveWindows(headers: unknown, now: number): RotationDecision["windows"] {
+  try {
+    const five = normalizeResetValue(
+      readHeader(headers, "anthropic-ratelimit-unified-5h-reset"),
+      now,
+    );
+    const seven = normalizeResetValue(
+      readHeader(headers, "anthropic-ratelimit-unified-7d-reset"),
+      now,
+    );
+    const claimRaw = readHeader(headers, UNIFIED_CLAIM_HEADER);
+    const claim = typeof claimRaw === "string" ? claimRaw.trim().toLowerCase() : undefined;
+    // Absent header: undefined, so the stored window is left alone rather than erased.
+    const binding =
+      claim === undefined ? undefined : claim === "five_hour" || claim === "seven_day" ? claim : null;
+    if (five === undefined && seven === undefined && binding == null) return undefined;
+    return {
+      fiveHourReset: five === undefined ? null : now + five * 1000,
+      sevenDayReset: seven === undefined ? null : now + seven * 1000,
+      binding,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function classifyInternal(input: ClassifyInput): RotationDecision {
   const status = input.status;
   const now = finiteNow(input.now);
@@ -325,6 +355,8 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
     // An explicit account-level rejection outranks the reset window. Without
     // this, a short retry-after would keep us retrying an account whose 5-hour
     // or 7-day quota is already spent.
+    const windows = resolveWindows(input.headers, now);
+
     if (unifiedStatusRejects(input.headers)) {
       const durationMs = reset
         ? safeDurationMs(reset.seconds)
@@ -334,10 +366,13 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
         until: safeUntil(now, durationMs),
         reason: `Account usage window rejected by Anthropic${reset ? `; resets in ${reset.seconds} seconds` : ""}`,
         source: reset?.source ?? "default",
+        windows,
       };
     }
 
-    if (reset !== undefined) return decisionFromReset(reset, now, input.attempt ?? 0);
+    if (reset !== undefined) {
+      return { ...decisionFromReset(reset, now, input.attempt ?? 0), windows };
+    }
     return {
       action: "ROTATE_COOLDOWN",
       until: safeUntil(now, DEFAULT_UNKNOWN_COOLDOWN_MS),
