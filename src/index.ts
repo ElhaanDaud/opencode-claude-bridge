@@ -180,6 +180,14 @@ const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
     modalities: { input: ["text", "image"], output: ["text"] },
     cost: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   },
+  // Prompts over 100k tokens are billed at 5x these rates; the catalog has one price tier.
+  "claude-haiku-5-5": {
+    name: "Claude Haiku 5.5",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125 },
+  },
   "claude-haiku-4-5-20251001": {
     name: "Claude Haiku 4.5",
     attachment: true, reasoning: false, tool_call: true, temperature: true,
@@ -261,15 +269,16 @@ export function rewriteSystemBlocksForModel(
   });
 }
 
-// Explicit allowlist: haiku and older sonnet variants (e.g. claude-sonnet-4-5)
+// Explicit allowlist: Haiku 4.5 and older sonnet variants (e.g. claude-sonnet-4-5)
 // reject the field entirely. Opus 4.x and Sonnet 4.6 are confirmed; Fable 5.x,
-// Opus 5.x and Sonnet 5 are documented as adaptive-thinking models.
+// Opus 5.x, Sonnet 5 and Haiku 5.5 are documented as adaptive-thinking models.
 const ADAPTIVE_THINKING_MODELS = [
   "claude-opus-4",
   "claude-sonnet-4-6",
   "claude-opus-5",
   "claude-sonnet-5",
   "claude-fable-5",
+  "claude-haiku-5",
 ];
 
 export function supportsAdaptiveThinking(model: unknown): boolean {
@@ -278,17 +287,45 @@ export function supportsAdaptiveThinking(model: unknown): boolean {
 
 const EFFORTS_ABOVE_HIGH = new Set(["xhigh", "max"]);
 
-// Sonnet 5.5 rejects thinking:{type:"disabled"} with a 400; "between_tools" is its lowest
-// thinking setting, accepts no other thinking field, and 400s at xhigh/max effort.
+// Sonnet 5.5 rejects thinking:{type:"disabled"} and {type:"enabled"} (budget_tokens; omo
+// builds it for metis, momus and sisyphus-junior) with a 400. "enabled" becomes adaptive;
+// "between_tools" is its lowest thinking setting, accepts no other thinking field, and 400s
+// at xhigh/max effort.
 export function normalizeThinkingForSonnet55(parsed: {
   model?: unknown;
   thinking?: { type?: string; [key: string]: unknown };
   output_config?: { effort?: string; [key: string]: unknown };
 }): void {
   if (typeof parsed.model !== "string" || !parsed.model.startsWith("claude-sonnet-5-5")) return;
+  if (parsed.thinking?.type === "enabled") {
+    const { budget_tokens, ...rest } = parsed.thinking;
+    parsed.thinking = { ...rest, type: "adaptive" };
+    return;
+  }
   if (parsed.thinking?.type === "disabled") parsed.thinking = { type: "between_tools" };
   if (parsed.thinking?.type !== "between_tools") return;
   parsed.thinking = { type: "between_tools" };
+  if (parsed.output_config?.effort && EFFORTS_ABOVE_HIGH.has(parsed.output_config.effort)) {
+    parsed.output_config.effort = "high";
+  }
+}
+
+// Haiku 5.5 400s on thinking:{type:"enabled"} (budget_tokens; omo sends it for some Claude
+// agents), so that becomes adaptive. "disabled" works at high effort or below, takes no
+// other thinking field, and 400s at xhigh/max.
+export function normalizeThinkingForHaiku55(parsed: {
+  model?: unknown;
+  thinking?: { type?: string; [key: string]: unknown };
+  output_config?: { effort?: string; [key: string]: unknown };
+}): void {
+  if (typeof parsed.model !== "string" || !parsed.model.startsWith("claude-haiku-5-5")) return;
+  if (parsed.thinking?.type === "enabled") {
+    const { budget_tokens, ...rest } = parsed.thinking;
+    parsed.thinking = { ...rest, type: "adaptive" };
+    return;
+  }
+  if (parsed.thinking?.type !== "disabled") return;
+  parsed.thinking = { type: "disabled" };
   if (parsed.output_config?.effort && EFFORTS_ABOVE_HIGH.has(parsed.output_config.effort)) {
     parsed.output_config.effort = "high";
   }
@@ -1003,7 +1040,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
                 // context_management and output_config.effort are only
                 // supported by thinking-capable models. Sending them to
-                // haiku (used for title generation) produces a 400.
+                // Haiku 4.5 produces a 400.
                 if (supportsThinking) {
                   if (!parsed.context_management) {
                     parsed.context_management = {
@@ -1015,6 +1052,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   }
                 }
                 normalizeThinkingForSonnet55(parsed);
+                normalizeThinkingForHaiku55(parsed);
 
                 if (!parsed.metadata) parsed.metadata = {};
                 if (!parsed.metadata.user_id) {

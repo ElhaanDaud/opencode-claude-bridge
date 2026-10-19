@@ -22,6 +22,7 @@ import {
   deriveModelDisplayName,
   failureSignature,
   getClaudeToolsForActiveOpenCodeTools,
+  normalizeThinkingForHaiku55,
   normalizeThinkingForSonnet55,
   rewriteSystemBlocksForModel,
   shouldInjectClaudeTools,
@@ -85,7 +86,7 @@ describe("thinking injection", () => {
     assert.deepEqual(out.thinking, { type: "adaptive" });
   });
 
-  for (const model of ["claude-opus-5-5", "claude-sonnet-5", "claude-sonnet-5-5", "claude-fable-5-1"]) {
+  for (const model of ["claude-opus-5-5", "claude-sonnet-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-5-5"]) {
     it(`injects adaptive thinking for ${model}`, () => {
       const out = transformBody(JSON.stringify({ model, messages: [] }));
       assert.deepEqual(out.thinking, { type: "adaptive" });
@@ -130,6 +131,12 @@ describe("Sonnet 5.5 thinking normalization", () => {
     assert.deepEqual(out.output_config, { effort: "max" });
   });
 
+  it("rewrites thinking:enabled to adaptive and drops budget_tokens", () => {
+    const out = run({ model: "claude-sonnet-5-5", thinking: { type: "enabled", budget_tokens: 32000 }, output_config: { effort: "high" } });
+    assert.deepEqual(out.thinking, { type: "adaptive" });
+    assert.deepEqual(out.output_config, { effort: "high" });
+  });
+
   it("does not touch other models (Sonnet 5 still accepts disabled)", () => {
     const out = run({ model: "claude-sonnet-5", thinking: { type: "disabled" } });
     assert.deepEqual(out.thinking, { type: "disabled" });
@@ -138,6 +145,51 @@ describe("Sonnet 5.5 thinking normalization", () => {
   it("tolerates a missing thinking block", () => {
     const out = run({ model: "claude-sonnet-5-5" });
     assert.equal(out.thinking, undefined);
+  });
+});
+
+describe("Haiku 5.5 thinking normalization", () => {
+  const run = (body: Record<string, unknown>) => {
+    normalizeThinkingForHaiku55(body);
+    return body;
+  };
+
+  it("passes every effort level through with adaptive thinking", () => {
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+      const out = run({ model: "claude-haiku-5-5", thinking: { type: "adaptive", display: "summarized" }, output_config: { effort } });
+      assert.deepEqual(out.thinking, { type: "adaptive", display: "summarized" });
+      assert.deepEqual(out.output_config, { effort });
+    }
+  });
+
+  it("rewrites thinking:enabled to adaptive and drops budget_tokens", () => {
+    const out = run({ model: "claude-haiku-5-5", thinking: { type: "enabled", budget_tokens: 32000 } });
+    assert.deepEqual(out.thinking, { type: "adaptive" });
+  });
+
+  it("keeps thinking:disabled at high effort or below", () => {
+    for (const effort of ["low", "medium", "high"]) {
+      const out = run({ model: "claude-haiku-5-5", thinking: { type: "disabled" }, output_config: { effort } });
+      assert.deepEqual(out.thinking, { type: "disabled" });
+      assert.deepEqual(out.output_config, { effort });
+    }
+  });
+
+  it("clamps xhigh and max effort to high when thinking is disabled", () => {
+    for (const effort of ["xhigh", "max"]) {
+      const out = run({ model: "claude-haiku-5-5", thinking: { type: "disabled" }, output_config: { effort } });
+      assert.deepEqual(out.output_config, { effort: "high" });
+    }
+  });
+
+  it("strips extra fields sent alongside disabled", () => {
+    const out = run({ model: "claude-haiku-5-5", thinking: { type: "disabled", display: "summarized" } });
+    assert.deepEqual(out.thinking, { type: "disabled" });
+  });
+
+  it("does not touch Haiku 4.5", () => {
+    const out = run({ model: "claude-haiku-4-5-20251001", thinking: { type: "enabled", budget_tokens: 1024 } });
+    assert.deepEqual(out.thinking, { type: "enabled", budget_tokens: 1024 });
   });
 });
 
