@@ -129,6 +129,9 @@ node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zsh
 node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.bashrc && source ~/.bashrc
 ```
 
+That defines a `claude-pool` shell function and wraps `claude`, so the full
+path is only needed this once.
+
 Then:
 
 ```bash
@@ -154,21 +157,9 @@ Once the pool holds at least one account, new logins are adopted automatically.
 **On OpenCode startup** — the plugin checks whether the Claude CLI is logged
 into an account the pool has not seen, and adopts it. Nothing to run.
 
-**Immediately after a login**, without restarting OpenCode, install a shell
-hook:
-
-```bash
-# zsh
-node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc && source ~/.zshrc
-# bash — the default on most Linux distros
-node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.bashrc && source ~/.bashrc
-```
-
-That defines a `claude-pool` shell function and wraps `claude`, so the full
-path is only needed this once.
-
-That wraps the `claude` command so a successful `claude login` is pooled right
-away. From then on the whole cycle is just:
+**Immediately after a login**, without restarting OpenCode: the shell hook you
+installed above wraps the `claude` command, so a successful `claude login` is
+pooled right away. From then on the whole cycle is just:
 
 ```bash
 claude login   # done — the account is in the pool
@@ -185,7 +176,7 @@ Auto-enrollment deliberately does nothing when:
 | Situation | Why |
 | --- | --- |
 | The pool is empty | Installing the plugin must never capture credentials from someone who has not opted in. Enroll one account by hand first. |
-| The account is already pooled | Matched by refresh token, so a re-login of the same account is not duplicated |
+| The account is already pooled | Matched by refresh token, then by email, so a re-login of the same account refreshes its entry instead of duplicating it |
 | The CLI credential is expired | It would enter the pool only to fail its first request and be disabled |
 | The account email cannot be resolved | There is no basis for a label; use `claude-pool enroll <label>` |
 
@@ -233,7 +224,8 @@ live rotation state on exit:
 ```bash
 cd ~/src/opencode-claude-bridge
 node scripts/qa-rotation.mjs
-# expected: 6/6 scenarios passed
+# expected: 10/10 scenarios passed
+node scripts/qa-rotation.mjs s3   # run one scenario (s1–s10)
 ```
 
 ---
@@ -326,7 +318,8 @@ claude-pool list
 ```
 
 With fewer than two usable accounts there is nowhere to rotate. Accounts marked
-`DISABLED` are excluded until re-enrolled.
+`DISABLED` are excluded until re-enrolled, or until `claude-pool enable <label>`
+if you know the credential is still good.
 
 ### Keychain prompts on every rotation (macOS)
 

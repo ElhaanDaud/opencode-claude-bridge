@@ -34,13 +34,10 @@ git clone https://github.com/dotCipher/opencode-claude-bridge.git ~/opencode-cla
 cd ~/opencode-claude-bridge && npm install && npm run build
 ```
 
-Then reference the full path in your config:
-
-```json
-{
-  "plugin": ["/Users/YOU/opencode-claude-bridge/dist/index.js"]
-}
-```
+Don't point OpenCode at `dist/index.js` directly. The loader calls every named
+export as a plugin factory, and this module exports helpers, so loading fails
+with `modelId.match is not a function`. Use a one-line wrapper that re-exports
+only the default instead. See [SETUP.md §3](SETUP.md#3-register-the-plugin).
 </details>
 
 ## How the bridge works
@@ -76,7 +73,7 @@ The bridge resolves this by:
 2. **Adding 16 Claude-only stub tools**: `AskUserQuestion`, `CronCreate`, `CronDelete`, `CronList`, `EnterPlanMode`, `EnterWorktree`, `ExitPlanMode`, `ExitWorktree`, `Monitor`, `NotebookEdit`, `PushNotification`, `RemoteTrigger`, `ScheduleWakeup`, `TaskOutput`, `TaskStop`, `WebSearch`.
 3. **Sorting all 26 tools alphabetically** to match Claude Code's ordering.
 
-If the model calls a stub tool, OpenCode's built-in error handling catches it, tells the model the tool is unavailable, and the model adapts on the next turn.
+Three of the stubs have OpenCode equivalents and are routed to them: `AskUserQuestion` -> `question`, `EnterPlanMode` -> `plan_enter`, `ExitPlanMode` -> `plan_exit`. If the model calls any other stub, OpenCode's built-in error handling catches it and tells the model the tool is unavailable, and the model adapts on the next turn.
 
 The bridge now selects tool schemas by target/model:
 
@@ -134,15 +131,25 @@ These are mapped in both directions — inbound responses and outbound historica
 
 Claude Code has 3 todo statuses; OpenCode has 4. The outbound direction maps `cancelled` -> `completed` since Claude Code doesn't have a cancelled state.
 
+`activeForm` <-> `priority` is a carrier mapping, not a semantic one. OpenCode types `priority` as a free string, so it holds Claude's `activeForm` text ("Running tests") on the way in and gives it back unchanged on the way out.
+
+### Model handling
+
+The bridge ships a fallback catalog, used only for model IDs that OpenCode's own list is missing: Fable 5.1, Opus 5.5 / 4.6 / 4.5, Sonnet 5.5 / 5 / 4.6 / 4.5, Haiku 5.5 / 4.5. It also normalizes `thinking` for models that reject some modes:
+
+- **Sonnet 5.5** rejects both `{type:"enabled", budget_tokens}` and `{type:"disabled"}`. `enabled` is rewritten to `adaptive`.
+- **Haiku 5.5** rejects `{type:"enabled"}`, which is rewritten to `adaptive`.
+- `temperature` is forced to `1` whenever thinking is enabled or adaptive, which the API requires.
+
 ### Dynamic fingerprint computation
 
 The `cc_version` billing metadata suffix (a 3-character hex string like `df0` or `e0a`) is computed dynamically per request using the same algorithm as Claude Code:
 
 ```
-SHA256(salt + message[4] + message[7] + message[20] + CLI_VERSION).slice(0, 3)
+SHA256(salt + text[4] + text[7] + text[20] + CLI_VERSION).slice(0, 3)
 ```
 
-The salt is hardcoded in Claude Code's source. This changes per conversation because the user's message text changes.
+`text` is the first user message's text. Any index past the end of the text contributes `"0"`. The salt is hardcoded in Claude Code's source. The value changes per conversation because the first message changes.
 
 ## Multi-account rotation
 
@@ -194,16 +201,27 @@ pooled account refreshes its entry instead of duplicating it. Set
 | Command | Purpose |
 | --- | --- |
 | `claude-pool enroll [label] [--replace]` | Add the account Claude CLI is logged into |
+| `claude-pool auto` | Enroll the logged-in account only if the pool has not seen it |
+| `claude-pool install-hook` | Print a shell function that runs `auto` after `claude login` |
 | `claude-pool whoami` | Show which account Claude CLI is logged into, and whether it is pooled |
 | `claude-pool list` | Every enrolled account with its status and token expiry |
 | `claude-pool status` | Active account and what rotation would pick next |
 | `claude-pool dashboard` | Interactive manager (prints the status when not in a terminal) |
 | `claude-pool enable <label>` | Re-enable one account (clears its cooldown or disabled flag) |
 | `claude-pool remove <label>` | Drop an account |
-| `claude-pool clear-cooldowns` | Re-enable every account after a rate-limit storm |
+| `claude-pool clear-cooldowns` | Re-enable every account (clears all cooldowns and disabled flags) |
 | `claude-pool help` | Show usage |
 
-Run these as `node scripts/claude-pool.mjs <command>`.
+`claude-pool` is declared as a `bin` in `package.json`. From a source checkout,
+either run `node scripts/claude-pool.mjs <command>` or install the shell hook
+above, which defines a `claude-pool` function.
+
+### Notifications
+
+Pool events appear as OpenCode toasts: an account switch, an account added by
+auto-enrollment, an account disabled (with the re-login hint), and every
+account cooling down (with the earliest reset). Identical toasts are shown at
+most once per minute.
 
 ### When rotation happens
 
@@ -211,11 +229,19 @@ Every failed response is classified before the response body is read:
 
 | Signal | Action |
 | --- | --- |
-| `429` with a reset under 60s | Back off, retry the **same** account |
+| `429` with a reset of 60s or less | Back off, retry the **same** account (up to 3 attempts, then rotate) |
 | `429` with a longer reset, or `anthropic-ratelimit-unified-status` not `allowed` | Cool the account down until its reset, switch accounts |
-| `403` naming suspension | Disable the account permanently, switch |
+| `429` with no determinable reset | Cool down for 1 hour, switch |
+| `403` whose body says suspended / disabled / banned | Disable the account, switch |
+| Other `403` | Cool down for 1 hour, switch |
 | `401` | Credential rejected even after refresh — disable, switch |
+| `5xx` | Retry the same account with exponential backoff (1s, 2s, 4s), then pass through |
 | Every account cooling | Fail fast as `429`, naming each account and the earliest reset |
+
+A 401/403 penalty is only applied once **another account succeeds** with the
+same request. If the next account fails identically, the request is blamed and
+neither account is penalised. If no other account is available, or the next
+one is merely rate-limited, the error passes through unpenalised.
 
 Reset windows are read from `retry-after`, then Anthropic's
 `anthropic-ratelimit-unified-*` headers (epoch seconds), preferring whichever
@@ -248,7 +274,14 @@ locks you out of that account.
 Refreshes therefore journal the new tokens to disk before committing them to
 the keychain, and any journal found at startup is replayed. Concurrent
 refreshes of one account collapse into a single call, since two parallel
-refreshes would spend the same token twice.
+refreshes would spend the same token twice. Across processes, refreshes are
+serialised by the rotation lock. A stale lock is reclaimed only once its holder
+is provably gone (same host: the PID no longer exists; other host: older than
+3 minutes).
+
+A refresh the token endpoint rejects disables the account. A network error or
+5xx cools it down for 60 seconds instead, so a brief outage can't disable every
+account in turn.
 
 The practical consequence: **after the pool refreshes an account, the Claude
 CLI's own stored copy of that credential is stale.** That is expected. Run
@@ -279,8 +312,17 @@ All OAuth and header parameters can be overridden via environment variables:
 | `ANTHROPIC_SYSTEM_PROMPT_PATH` | `~/.cache/opencode-claude-bridge/claude-system-prompt.json` | Path to cached system prompt |
 | `ANTHROPIC_DEFAULT_EFFORT` | `medium` | Thinking effort level |
 | `ANTHROPIC_SESSION_ID` | (generated) | Override session ID |
+| `ANTHROPIC_USER_AGENT` | `claude-cli/<version> (external, <entrypoint>)` | Full user-agent override |
+| `ANTHROPIC_PROFILE_URL` | `https://api.anthropic.com/api/oauth/profile` | Account profile endpoint (email lookup) |
+| `ANTHROPIC_USAGE_URL` | `https://api.anthropic.com/api/oauth/usage` | Usage endpoint (dashboard) |
+| `ANTHROPIC_MANUAL_REDIRECT_URL` | `https://platform.claude.com/oauth/code/callback` | Redirect for copy-paste OAuth |
+| `ANTHROPIC_SCOPES` | Claude CLI's full scope set | OAuth scopes |
+| `ANTHROPIC_CLEAR_THINKING_TYPE` | `clear_thinking_20251015` | `context_management` edit type |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Where the Claude CLI credential file lives (Linux) |
+| `CLAUDE_POOL_AUTO_ENROLL` | enabled | Set to `0` to disable auto-enrollment on startup |
+| `CLAUDE_POOL_STATE_PATH` | `~/.local/share/opencode-claude-bridge/rotation-state.json` | Rotation state file (the lock stays at the default path) |
 
-Most users won't need to change these — the bridge auto-detects the installed Claude CLI version and uses matching defaults.
+Most users won't need to change these. The bridge detects the installed Claude CLI version, re-checks it every 10 minutes since Claude Code auto-updates, and uses matching defaults.
 
 ## Local validation
 
@@ -330,18 +372,36 @@ Key things that have changed across versions:
 
 ```
 src/
-  index.ts          — Main plugin entry point: tool replacement, request/response
-                      transformation, bidirectional parameter translation (~886 lines)
-  claude-tools.ts   — 24 Claude Code tool definitions, fingerprint computation,
-                      parameter translation maps (~757 lines)
-  constants.ts      — Version strings, URLs, env overrides, header values (117 lines)
-  keychain.ts       — macOS Keychain access for OAuth tokens
-  oauth.ts          — OAuth PKCE flow with local callback server
+  index.ts           — Plugin entry: model catalog, tool replacement, request/response
+                       transformation, thinking normalization, pool rotation loop
+  claude-tools.ts    — 26 Claude Code tool definitions (10 shared + 16 stubs),
+                       fingerprint computation, parameter translation
+  stream.ts          — SSE rewriting: buffers tool_use input per block, translates names/args
+  constants.ts       — CLI version detection, URLs, env overrides, header values
+  keychain.ts        — Claude CLI credential read (macOS Keychain / credentials file)
+  oauth.ts           — OAuth PKCE flow and token refresh
+  pool/
+    manager.ts       — Account acquisition, refresh with journal + in-flight dedupe
+    rotation-state.ts — Rotation state file and cross-process lock
+    classifier.ts    — Maps failed responses to retry / cooldown / disable decisions
+    selection.ts     — Picks the next usable account
+    secret-store.ts  — Per-account credential storage (Keychain or 0600 files)
+    enroll.ts        — Enrollment and auto-adoption of new logins
+    bridge.ts        — Wires the pool into the plugin (mirror into auth.json)
+    usage.ts         — OAuth usage endpoint client
+    notify.ts        — Deduplicated OpenCode toasts
+    dashboard.ts, tui.ts — `claude-pool dashboard` interactive manager
+    types.ts         — Shared pool types
 
 scripts/
+  claude-pool.mjs             — `claude-pool` CLI (bin entry)
+  qa-rotation.mjs             — End-to-end rotation scenarios (real API + local fake upstream)
   validate-opencode-oauth.js  — Side-by-side wire comparison tool
   intercept-claude.sh         — mitmproxy-based Claude CLI request capture
 ```
+
+Tests live next to their sources (`*.test.ts`) and run with `npm test`, which
+builds first and runs everything under `dist/` with `node --test`.
 
 ## Important limitation
 
