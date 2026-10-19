@@ -49,8 +49,15 @@ import type {
 
 export type AccountStore = ReturnType<typeof createAccountStore>;
 
-/** Refresh a token pair. Sync, mirroring oauth.ts's curl-based refreshTokens. */
-export type RefreshFn = (refreshToken: string) => PoolOAuthTokens;
+/**
+ * Refresh a token pair.
+ *
+ * May be sync or async. Prefer async: a synchronous refresh blocks the event
+ * loop for the whole round trip, stalling every session in the process.
+ */
+export type RefreshFn = (
+  refreshToken: string,
+) => PoolOAuthTokens | Promise<PoolOAuthTokens>;
 
 /** Mirror the active account into opencode's single `anthropic` auth slot. */
 export type MirrorFn = (tokens: PoolOAuthTokens) => Promise<void>;
@@ -91,9 +98,15 @@ export const TRANSIENT_REFRESH_COOLDOWN_MS = 60_000;
  * so both the HTTP status and the OAuth error code are available in the text.
  */
 export function isCredentialRejected(detail: string): boolean {
-  return /invalid_grant|invalid_client|unauthorized_client|access_denied|\((?:400|401|403)\)/i.test(
-    detail,
-  );
+  // OAuth error codes are unambiguous wherever they appear.
+  if (/\b(?:invalid_grant|invalid_client|unauthorized_client|access_denied)\b/i.test(detail)) {
+    return true;
+  }
+  // A bare status must come from OUR message prefix, not from anywhere in the
+  // text. Matching loosely meant a gateway body containing "(403)" — or an
+  // incidental "(401)" in a network error — permanently disabled a healthy
+  // account, and disabling requires manual operator action to undo.
+  return /^Token refresh failed \((?:400|401|403)\)/i.test(detail.trim());
 }
 
 export function defaultJournalPath(): string {
@@ -249,7 +262,7 @@ export function createRotationManager(opts: ManagerOptions) {
         if (!current) throw new Error(`Account "${label}" is not enrolled`);
         if (isFresh(current.oauth, clock())) return current.oauth;
 
-        const fresh = refreshFn(current.oauth.refresh);
+        const fresh = await refreshFn(current.oauth.refresh);
 
         // Journal BEFORE committing: the server has already invalidated the
         // old refresh token, so these are now the only usable credentials.

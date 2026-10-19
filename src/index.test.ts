@@ -188,9 +188,8 @@ describe("OAuth error parsing", () => {
     assert.equal(detail, "invalid_grant: refresh token not found or invalid");
   });
 
-  it("falls back to raw response bodies when parsing fails", () => {
-    const detail = extractOAuthErrorDetail("plain failure body");
-    assert.equal(detail, "plain failure body");
+  it("returns null for a non-JSON body instead of quoting it", () => {
+    assert.equal(extractOAuthErrorDetail("<html><title>Just a moment...</title></html>"), null);
   });
 });
 

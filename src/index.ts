@@ -394,7 +394,7 @@ async function refreshAuth(
   const errors: string[] = [];
   const attemptedRefreshTokens = new Set<string>();
 
-  const tryRefresh = (refreshToken: string | undefined): Tokens | null => {
+  const tryRefresh = async (refreshToken: string | undefined): Promise<Tokens | null> => {
     if (!refreshToken || attemptedRefreshTokens.has(refreshToken)) return null;
     attemptedRefreshTokens.add(refreshToken);
     return refreshTokens(refreshToken);
@@ -404,7 +404,7 @@ async function refreshAuth(
   // valid. Expired keychain refresh tokens are often stale after re-login, so
   // do not try them before OpenCode's own stored OAuth refresh token.
   try {
-    const kt = getClaudeTokens({ refreshExpired: false });
+    const kt = getClaudeTokens();
     if (kt && kt.expires > Date.now() + 60_000) fresh = kt;
   } catch (err) {
     errors.push(String(err));
@@ -412,7 +412,7 @@ async function refreshAuth(
 
   // Layer 2: Stored refresh token
   if (!fresh && auth.refresh) {
-    try { fresh = tryRefresh(auth.refresh); }
+    try { fresh = await tryRefresh(auth.refresh); }
     catch (err) { errors.push(String(err)); }
   }
 
@@ -421,17 +421,24 @@ async function refreshAuth(
     try {
       const creds = readClaudeCredentials();
       if (creds?.claudeAiOauth?.refreshToken)
-        fresh = tryRefresh(creds.claudeAiOauth.refreshToken);
+        fresh = await tryRefresh(creds.claudeAiOauth.refreshToken);
     } catch (err) {
       errors.push(String(err));
     }
   }
 
   if (fresh) {
-    await storeAuth(client, fresh);
+    // In memory first: the old refresh token is already spent, so if persisting
+    // fails these are the only valid credentials this process has.
     auth.access = fresh.access;
     auth.refresh = fresh.refresh;
     auth.expires = fresh.expires;
+    try {
+      await storeAuth(client, fresh);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message.split("\n")[0]!.slice(0, 200) : String(err);
+      console.error(`[opencode-claude-bridge] refreshed tokens could not be saved; they stay valid in memory until restart: ${detail}`);
+    }
     return fresh.access;
   }
 
@@ -690,7 +697,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
     if (poolActive) {
       await pool.acquire();
     } else {
-      const tokens = getClaudeTokens({ refreshExpired: false });
+      const tokens = getClaudeTokens();
       if (tokens) await storeAuth(client, tokens);
     }
   } catch {}
@@ -735,7 +742,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               const acquired = await pool.acquire();
               if (acquired.kind === "ok") auth = await getAuth();
             } else {
-              const tokens = getClaudeTokens({ refreshExpired: false });
+              const tokens = getClaudeTokens();
               if (tokens) {
                 await storeAuth(client, tokens);
                 auth = { type: "oauth", ...tokens };
@@ -1169,7 +1176,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
           type: "oauth" as const,
           authorize: async () => {
             // First try: auto-bootstrap from Claude CLI keychain
-            const tokens = getClaudeTokens({ refreshExpired: false });
+            const tokens = getClaudeTokens();
             if (tokens) {
               await storeAuth(client, tokens);
               return {
@@ -1221,7 +1228,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
                     if (autoCode) {
                       // Auto-flow captured the code via localhost redirect
-                      const tokens = exchangeCodeForTokens(autoCode, verifier, redirectUri);
+                      const tokens = await exchangeCodeForTokens(autoCode, verifier, redirectUri);
                       await storeAuth(client, tokens);
                       callbackServer?.close();
                       return { type: "success" as const, ...tokens };
@@ -1235,7 +1242,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                     }
 
                     // Manual flow — redirect_uri defaults to MANUAL_REDIRECT_URL
-                    const tokens = exchangeCodeForTokens(code, verifier);
+                    const tokens = await exchangeCodeForTokens(code, verifier);
                     await storeAuth(client, tokens);
                     callbackServer?.close();
                     return { type: "success" as const, ...tokens };
@@ -1261,7 +1268,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               callback: async (code: string) => {
                 try {
                   // redirect_uri defaults to MANUAL_REDIRECT_URL in exchangeCodeForTokens
-                  const tokens = exchangeCodeForTokens(parseAuthCode(code), verifier);
+                  const tokens = await exchangeCodeForTokens(parseAuthCode(code), verifier);
                   await storeAuth(client, tokens);
                   return { type: "success" as const, ...tokens };
                 } catch (err) {

@@ -60,6 +60,27 @@ describe("audit H2: refresh failure classification", () => {
     assert.equal(isCredentialRejected("connect ETIMEDOUT 1.2.3.4:443"), false);
     assert.equal(isCredentialRejected("spawn curl ENOENT"), false);
   });
+
+  it("does not treat a status outside our own prefix as a credential rejection", () => {
+    // A gateway body or a network error can contain "(403)"/"(401)". Treating
+    // those as rejections permanently disabled healthy accounts, and undoing a
+    // disable needs manual operator action.
+    assert.equal(
+      isCredentialRejected("Token refresh failed (502): <html>Error (403) Forbidden</html>"),
+      false,
+    );
+    assert.equal(
+      isCredentialRejected("Token refresh failed: ETIMEDOUT after (401) retries logged"),
+      false,
+    );
+    assert.equal(isCredentialRejected("Token refresh failed (503): upstream busy"), false);
+  });
+
+  it("still catches genuine credential rejections", () => {
+    assert.equal(isCredentialRejected("Token refresh failed (400): invalid_grant"), true);
+    assert.equal(isCredentialRejected("Token refresh failed (401): token revoked"), true);
+    assert.equal(isCredentialRejected("provider said invalid_grant"), true);
+  });
 });
 
 describe("re-enrollment restores a disabled account", () => {

@@ -196,6 +196,27 @@ describe("rotation manager token acquisition", () => {
   });
 });
 
+describe("rotation manager token-endpoint firewall pages", () => {
+  it("cools every account on an HTML 403 instead of disabling the pool", async (t) => {
+    const { parseTokenResponse } = await import("../oauth.js");
+    const page = "<html><head><title>Just a moment...</title></head><body>challenge</body></html>";
+    const h = harness(
+      t,
+      ["a", "b", "c"].map((label) => record(label, { expires: NOW - 1 })),
+      () => parseTokenResponse(403, page, "Token refresh"),
+    );
+
+    const result = await h.manager.acquire();
+
+    assert.equal(result.kind, "exhausted");
+    for (const account of Object.values(h.state.load().accounts)) {
+      assert.equal(account.disabled, false);
+      assert.ok((account.cooldownUntil ?? 0) > NOW);
+      assert.ok(!account.lastReason?.includes("<html"), account.lastReason ?? "");
+    }
+  });
+});
+
 describe("rotation manager journal replay", () => {
   it("commits a journal left behind by a crashed process", async (t) => {
     const h = harness(t, [record("alice")]);
