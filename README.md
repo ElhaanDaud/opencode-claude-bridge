@@ -1,4 +1,4 @@
-# opencode-claude-bridge
+# opencode-claude-pool
 
 Use your Claude Pro/Max subscription in [OpenCode](https://opencode.ai). If you're logged into the Claude CLI, it just works — no extra setup.
 
@@ -43,6 +43,28 @@ cd ~/src/opencode-claude-bridge && git pull && npm ci && npm run build
 ```
 
 Then restart OpenCode. Full walkthrough, Linux notes and troubleshooting: [SETUP.md](SETUP.md).
+
+### OpenCode 2
+
+OpenCode 2 has a new plugin API, so it loads a separate entrypoint from the
+same build. Point `plugins` (plural, V2's key) at the `dist/opencode2`
+directory; no wrapper is needed:
+
+```json
+{
+  "plugins": ["file:///Users/YOU/src/opencode-claude-bridge/dist/opencode2"]
+}
+```
+
+On V2 the bridge rewrites each Anthropic request in V2's `http.request` hook
+(bearer, Claude Code headers, billing block, system prompt, thinking fields)
+and rotates accounts in `http.response`. Current differences from V1:
+
+- Tool schemas are sent as V2 defines them. The Claude Code tool mapping is not applied yet.
+- Pool events are logged rather than shown as toasts, since V2's plugin API has no toast call.
+- V2 has no `auth.json` slot, so nothing is mirrored there. The pool injects the token per request.
+- Without enrolled accounts it uses the Claude CLI login as-is and never refreshes it, because V2 gives it nowhere to persist a rotated refresh token. Run `claude` to refresh it, or enroll the account.
+- A credential you configure in V2 itself (an Anthropic API key) takes precedence, and the bridge leaves those requests alone.
 
 ## How the bridge works
 
@@ -293,7 +315,7 @@ CLI's own stored copy of that credential is stale.** That is expected. Run
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1.2+
+- [OpenCode](https://opencode.ai) v1.2+, or v2 (tested on 2.0.32; see [OpenCode 2](#opencode-2))
 - For OAuth: [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in (`claude login`)
 - macOS (Keychain) or Linux (`~/.claude/.credentials.json` fallback)
 - For API key: just configure a `provider` with `apiKey` in your OpenCode config as usual
@@ -384,6 +406,8 @@ src/
   constants.ts       — CLI version detection, URLs, env overrides, header values
   keychain.ts        — Claude CLI credential read (macOS Keychain / credentials file)
   oauth.ts           — OAuth PKCE flow and token refresh
+  opencode2/
+    server.ts        — OpenCode 2 entrypoint: http.request rewrite, http.response rotation
   pool/
     manager.ts       — Account acquisition, refresh with journal + in-flight dedupe
     rotation-state.ts — Rotation state file and cross-process lock
