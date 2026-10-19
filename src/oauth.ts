@@ -243,10 +243,18 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
     const escapeHtml = (s: string) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+    let expectedState: string | null = null;
+
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url || "/", `http://localhost`);
 
       if (url.pathname === "/callback") {
+        // Ignore (don't reject): a forged hit must not consume the one-shot promise.
+        if (expectedState === null || url.searchParams.get("state") !== expectedState) {
+          res.writeHead(400, { "Content-Type": "text/plain" });
+          res.end("State mismatch");
+          return;
+        }
         const code = url.searchParams.get("code");
         const error = url.searchParams.get("error");
 
@@ -290,6 +298,7 @@ export function startOAuthCallbackServer(): Promise<OAuthCallbackServer> {
 
       const port = addr.port;
       const { automaticUrl, manualUrl, verifier, state } = buildAuthUrls(port);
+      expectedState = state;
 
       resolve({
         url: automaticUrl,
@@ -354,6 +363,16 @@ export function parseAuthCode(raw: string): string {
   }
 
   return code.trim();
+}
+
+/** The state carried by a pasted `code#state` or callback URL, if any. */
+export function parsePastedState(raw: string): string | null {
+  const text = raw.trim();
+  const query = text.match(/[?&]state=([^&#]+)/);
+  if (query) return decodeURIComponent(query[1]!);
+  const hash = text.indexOf("#");
+  if (hash === -1) return null;
+  return text.slice(hash + 1).trim() || null;
 }
 
 export async function exchangeCodeForTokens(
