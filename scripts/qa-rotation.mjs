@@ -10,37 +10,27 @@
 import http from "node:http";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { createRotationStateStore, defaultStatePath } from "../dist/pool/rotation-state.js";
+import { createRotationStateStore, defaultLockPath, defaultStatePath } from "../dist/pool/rotation-state.js";
 import OpenCodeClaudeBridge from "../dist/index.js";
 
+// A running OpenCode writes the live state file under its own lock while this
+// harness deletes and rewrites it, so the two raced and scenario penalties
+// leaked into the live pool. Scenarios get a private state file instead. The
+// lock and refresh journal deliberately stay shared: they guard the real
+// credentials, and a private lock would let two processes spend one token.
+if (!process.env.CLAUDE_POOL_STATE_PATH) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qa-rotation-"));
+  process.env.CLAUDE_POOL_STATE_PATH = path.join(dir, "rotation-state.json");
+  process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
+}
 const statePath = defaultStatePath();
-const state = createRotationStateStore({ path: statePath });
+const state = createRotationStateStore({ path: statePath, lockPath: defaultLockPath() });
 
 function resetState() {
   try { fs.rmSync(statePath, { force: true }); } catch {}
-  try { fs.rmSync(`${statePath}.lock`, { force: true }); } catch {}
 }
-
-// This harness drives the real plugin, which resolves the production rotation
-// state path. Scenarios deliberately corrupt that state, so the live file is
-// snapshotted here and restored on exit -- otherwise running QA silently
-// discards which account is active and which are cooling down.
-const savedState = (() => {
-  try { return fs.readFileSync(statePath, "utf8"); } catch { return null; }
-})();
-
-function restoreLiveState() {
-  try { fs.rmSync(`${statePath}.lock`, { force: true }); } catch {}
-  if (savedState === null) {
-    try { fs.rmSync(statePath, { force: true }); } catch {}
-    return;
-  }
-  fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(statePath, savedState, { mode: 0o600 });
-}
-
-process.on("exit", restoreLiveState);
 
 function fakeClient() {
   const store = { value: null };
@@ -82,9 +72,14 @@ function startMockUpstream(script) {
     req.on("end", () => {
       const step = script[Math.min(i, script.length - 1)];
       i += 1;
+      let userAccount = null;
+      try {
+        userAccount = JSON.parse(JSON.parse(body).metadata?.user_id ?? "null")?.account_uuid ?? null;
+      } catch {}
       seen.push({
         auth: req.headers["authorization"] ?? "",
         url: req.url,
+        userAccount,
       });
       res.writeHead(step.status, {
         "content-type": "application/json",
@@ -235,7 +230,7 @@ async function s5() {
   });
   await res.text();
 
-  const disabled = Object.entries(state.load().accounts).filter(([, a]) => a.disabled);
+  const disabled = scenarioAccounts().filter(([, a]) => a.disabled);
   await up.close();
 
   record(
@@ -267,7 +262,7 @@ async function s6() {
   });
   await res.text();
 
-  const disabled = Object.entries(state.load().accounts).filter(([, a]) => a.disabled);
+  const disabled = scenarioAccounts().filter(([, a]) => a.disabled);
   const rotated = up.seen[0]?.auth !== up.seen[1]?.auth;
   await up.close();
 
@@ -278,8 +273,123 @@ async function s6() {
   );
 }
 
+// Penalties from the mocked responses only. Accounts whose real refresh token
+// is already dead get disabled during acquire(), which is not what S7/S8 test.
+function scenarioAccounts() {
+  return Object.entries(state.load().accounts).filter(
+    ([, a]) => !/^(refresh (rejected|failed)|credentials missing)/.test(a.lastReason ?? ""),
+  );
+}
+
+function penalised() {
+  return scenarioAccounts()
+    .filter(([, a]) => a.disabled || (a.cooldownUntil !== null && a.cooldownUntil > Date.now()))
+    .map(([label, a]) => `${label}: ${a.lastReason}`);
+}
+
+async function identicalFailureScenario(name, failure) {
+  resetState();
+  const up = await startMockUpstream([failure, failure, { status: 200, body: { type: "message", content: [] } }]);
+  const doFetch = await makeFetch(fakeClient());
+  const res = await doFetch(up.url, {
+    method: "POST",
+    body: messagesBody(),
+    headers: { "content-type": "application/json" },
+  });
+  await res.text();
+
+  const hit = penalised();
+  const twoAccounts = up.seen.length === 2 && up.seen[0].auth !== up.seen[1].auth;
+  await up.close();
+
+  record(
+    name,
+    res.status === failure.status && hit.length === 0 && twoAccounts,
+    `HTTP ${res.status} | upstream calls=${up.seen.length} | distinct accounts=${twoAccounts} | penalised=${JSON.stringify(hit)}`,
+  );
+}
+
+// ── S7/S8: a failure caused by the request, not the account ─────────
+// The same 401/403 from two different accounts must pass through without
+// disabling or cooling anything; previously it walked the whole pool.
+async function s7() {
+  await identicalFailureScenario("S7 identical 401 on two accounts penalises nobody", {
+    status: 401,
+    body: { type: "error", error: { type: "authentication_error", message: "OAuth authentication is currently not supported." } },
+  });
+}
+
+async function s8() {
+  await identicalFailureScenario("S8 identical 403 on two accounts penalises nobody", {
+    status: 403,
+    body: { type: "error", error: { type: "permission_error", message: "Your account does not have access to this model." } },
+  });
+}
+
+// ── S9: distinct failures are each charged to their own account ─────
+async function s9() {
+  resetState();
+  const up = await startMockUpstream([
+    { status: 403, body: { type: "error", error: { type: "permission_error", message: "no access to model" } } },
+    { status: 401, body: { type: "error", error: { type: "authentication_error", message: "OAuth access token has been revoked." } } },
+    { status: 200, body: { type: "message", content: [] } },
+  ]);
+  const doFetch = await makeFetch(fakeClient());
+  const res = await doFetch(up.url, {
+    method: "POST",
+    body: messagesBody(),
+    headers: { "content-type": "application/json" },
+  });
+  await res.text();
+
+  const accounts = scenarioAccounts().map(([, a]) => a);
+  const cooled = accounts.filter((a) => !a.disabled && a.cooldownUntil > Date.now()).length;
+  const disabled = accounts.filter((a) => a.disabled).length;
+  const distinct = new Set(up.seen.map((s) => s.auth)).size;
+  await up.close();
+
+  record(
+    "S9 distinct 403 then 401 then success charges both accounts",
+    res.status === 200 && cooled === 1 && disabled === 1 && distinct === 3,
+    `HTTP ${res.status} | cooled=${cooled} disabled=${disabled} | distinct accounts=${distinct}`,
+  );
+}
+
+// ── S10: metadata.user_id follows the account actually serving the request ──
+async function s10() {
+  resetState();
+  const up = await startMockUpstream([
+    { status: 429, headers: { "retry-after": "21600" } },
+    { status: 200, body: { type: "message", content: [] } },
+  ]);
+  const doFetch = await makeFetch(fakeClient());
+  const res = await doFetch(up.url, {
+    method: "POST",
+    body: messagesBody(),
+    headers: { "content-type": "application/json" },
+  });
+  await res.text();
+  const [first, second] = up.seen;
+  await up.close();
+
+  const ok =
+    res.status === 200 &&
+    first?.auth !== second?.auth &&
+    Boolean(second?.userAccount) &&
+    second.userAccount !== first?.userAccount;
+  record(
+    "S10 rotation re-stamps user_id with the new account",
+    ok,
+    `HTTP ${res.status} | uuid#1=${first?.userAccount?.slice(0, 8)} uuid#2=${second?.userAccount?.slice(0, 8)}`,
+  );
+}
+
 const only = process.argv[2];
-const all = { s1, s2, s3, s4, s5, s6 };
+const all = { s1, s2, s3, s4, s5, s6, s7, s8, s9, s10 };
+if (only && !Object.hasOwn(all, only)) {
+  console.error(`Unknown scenario "${only}". Choose one of: ${Object.keys(all).join(", ")}`);
+  process.exit(2);
+}
 for (const [name, fn] of Object.entries(all)) {
   if (only && only !== name) continue;
   try {
@@ -289,7 +399,6 @@ for (const [name, fn] of Object.entries(all)) {
   }
 }
 
-restoreLiveState();
 const failed = results.filter((r) => !r.pass);
 console.log(`\n===== ${results.length - failed.length}/${results.length} scenarios passed =====`);
 process.exit(failed.length === 0 ? 0 : 1);

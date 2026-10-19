@@ -36,7 +36,8 @@ import {
 } from "./claude-tools.js";
 import type { ToolDefinition } from "./claude-tools.js";
 import { createSseProcessor } from "./stream.js";
-import { buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
+import { buildPoolBusyResponse, buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
+import { LockTimeoutError } from "./pool/rotation-state.js";
 import { autoEnrollIfNew } from "./pool/enroll.js";
 import { createAccountStore, createSecretBackend } from "./pool/secret-store.js";
 import type { RotationManager } from "./pool/manager.js";
@@ -513,6 +514,16 @@ function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> 
   });
 }
 
+// Pool bookkeeping waits on a cross-process lock that a slow token refresh
+// elsewhere can hold past the 10s timeout; that must never fail a request.
+async function recordPoolState(what: string, action: () => Promise<void>): Promise<void> {
+  try {
+    await action();
+  } catch (err) {
+    console.error(`[claude-pool] could not record ${what}; continuing: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 export function failureSignature(status: number, bodyText: string): string {
   try {
     const parsed = JSON.parse(bodyText) as { error?: { type?: unknown; message?: unknown } };
@@ -827,7 +838,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             let activeLabel: string | null = null;
 
             if (poolActive) {
-              const acquired = await pool.acquire();
+              let acquired: Awaited<ReturnType<typeof pool.acquire>>;
+              try {
+                acquired = await pool.acquire();
+              } catch (err) {
+                if (!(err instanceof LockTimeoutError)) throw err;
+                console.error(`[claude-pool] ${err.message}`);
+                return buildPoolBusyResponse();
+              }
               if (acquired.kind === "exhausted") {
                 const message = pool.describeExhaustion(acquired.info);
                 console.error(`[claude-pool] ${message}`);
@@ -1088,7 +1106,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               const unconfirmed: Array<{ label: string; decision: RotationDecision; signature: string }> = [];
               const confirmPenalties = async () => {
                 for (const { label, decision } of unconfirmed.splice(0)) {
-                  await pool.applyDecision(label, decision);
+                  await recordPoolState(`penalty for "${label}"`, () => pool.applyDecision(label, decision));
                 }
               };
               const unconfirmedLabels = () => unconfirmed.map((u) => `"${u.label}"`).join(", ");
@@ -1164,13 +1182,21 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   console.error(
                     `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
                   );
-                  await pool.applyDecision(activeLabel, decision);
+                  const penalised = activeLabel;
+                  await recordPoolState(`penalty for "${penalised}"`, () => pool.applyDecision(penalised, decision));
                 }
 
                 rotations += 1;
                 if (rotations > maxRotations) return rebuild();
 
-                const next = await pool.acquire(tried);
+                let next: Awaited<ReturnType<typeof pool.acquire>>;
+                try {
+                  next = await pool.acquire(tried);
+                } catch (err) {
+                  if (!(err instanceof LockTimeoutError)) throw err;
+                  console.error(`[claude-pool] ${err.message}; passing the current error through`);
+                  return rebuild();
+                }
                 if (next.kind === "exhausted" && unconfirmed.length > 0) {
                   // Unconfirmed disables need manual repair; surface the real error.
                   console.error(
@@ -1209,7 +1235,8 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             }
 
             if (poolActive && activeLabel && response.ok) {
-              await pool.markSuccess(activeLabel);
+              const served = activeLabel;
+              await recordPoolState(`success for "${served}"`, () => pool.markSuccess(served));
             }
 
             if (!poolActive && response.status === 401) {

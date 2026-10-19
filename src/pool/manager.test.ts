@@ -59,6 +59,7 @@ interface Harness {
   refreshCalls: string[];
   mirrored: PoolOAuthTokens[];
   journalPath: string;
+  statePath: string;
   setNow: (n: number) => void;
 }
 
@@ -76,8 +77,9 @@ function harness(
   let now = NOW;
   const clock = () => now;
   const accounts = createAccountStore(memoryBackend(seed));
+  const statePath = path.join(root, "rotation-state.json");
   const state = createRotationStateStore({
-    path: path.join(root, "rotation-state.json"),
+    path: statePath,
     clock,
     lockPollMs: 1,
   });
@@ -113,6 +115,7 @@ function harness(
     refreshCalls,
     mirrored,
     journalPath,
+    statePath,
     setNow: (n) => {
       now = n;
     },
@@ -217,6 +220,84 @@ describe("rotation manager token-endpoint firewall pages", () => {
   });
 });
 
+describe("rotation manager lock contention during refresh", () => {
+  // A second process on the same pool: real-clock locks with a short timeout.
+  function otherProcess(h: Harness, refreshCalls: string[]) {
+    return createRotationManager({
+      accounts: h.accounts,
+      state: createRotationStateStore({ path: h.statePath, lockPollMs: 1, lockTimeoutMs: 100 }),
+      clock: () => NOW,
+      journalPath: h.journalPath,
+      refreshFn: (token) => {
+        refreshCalls.push(token);
+        throw new Error("must not refresh while another process holds the lock");
+      },
+      mirrorFn: async () => {},
+    });
+  }
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Timeline (ms): holder takes the lock at 0; the other process reads a stale
+  // token at ~20 and then waits for the lock until ~120.
+  function holdLock(h: Harness, holdMs: number, whileHeld: () => Promise<void> = async () => {}) {
+    const holder = createRotationStateStore({ path: h.statePath, lockPollMs: 1 });
+    return holder.withLock(async () => {
+      await whileHeld();
+      await sleep(holdMs);
+    });
+  }
+
+  it("uses the holder's freshly refreshed token instead of cooling the account", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    const calls: string[] = [];
+    await h.manager.sync();
+    // The holder's refresh lands at ~60, after the stale read but before the timeout.
+    const held = holdLock(h, 400, async () => {
+      await sleep(60);
+      await h.accounts.updateTokens("alice", { access: "access-alice-v2", refresh: "refresh-alice-v2", expires: NOW + 3_600_000 });
+    });
+    await sleep(20);
+
+    const result = await otherProcess(h, calls).acquire();
+    await held;
+
+    assert.equal(result.kind === "ok" && result.accessToken, "access-alice-v2");
+    assert.deepEqual(calls, []);
+    assert.equal(h.state.load().accounts.alice?.cooldownUntil ?? null, null);
+  });
+
+  it("falls back to another usable account while the lock is busy", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 }), record("bob")]);
+    await h.manager.sync();
+    const held = holdLock(h, 400);
+    await sleep(20);
+
+    const result = await otherProcess(h, []).acquire();
+    await held;
+
+    assert.equal(result.kind === "ok" && result.label, "bob");
+    const alice = h.state.load().accounts.alice;
+    assert.equal(alice?.cooldownUntil ?? null, null);
+    assert.equal(alice?.disabled, false);
+  });
+
+  it("fails the request without penalising the account when the token is still stale", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    await h.manager.sync();
+    // Released at ~150, just after the timeout, so a cooldown write would succeed.
+    const held = holdLock(h, 150);
+    await sleep(20);
+
+    await assert.rejects(otherProcess(h, []).acquire(), /timed out/);
+    await held;
+
+    const alice = h.state.load().accounts.alice;
+    assert.equal(alice?.cooldownUntil ?? null, null);
+    assert.equal(alice?.disabled, false);
+  });
+});
+
 describe("rotation manager keychain read failures", () => {
   it("cools an account whose credentials cannot be read, instead of disabling it", async (t) => {
     const h = harness(t, [record("alice"), record("bob")]);
@@ -264,7 +345,61 @@ describe("rotation manager journal replay", () => {
     const h = harness(t, [record("alice")]);
     assert.equal(await h.manager.replayJournal(), false);
   });
+
+  it("keeps the lock held until the replayed tokens are committed", async (t) => {
+    const h = harness(t, [record("alice")]);
+    writePendingJournal(h.journalPath);
+    const events: string[] = [];
+    const originalUpdate = h.accounts.updateTokens.bind(h.accounts);
+    h.accounts.updateTokens = async (label, tokens) => {
+      events.push("commit-start");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const updated = await originalUpdate(label, tokens);
+      events.push("commit-end");
+      return updated;
+    };
+
+    const replay = h.manager.replayJournal();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Stands in for another OpenCode process contending for the same lock.
+    const otherProcess = h.state.withLock(() => {
+      events.push("other-process-lock");
+    });
+    await Promise.all([replay, otherProcess]);
+
+    assert.deepEqual(events, ["commit-start", "commit-end", "other-process-lock"]);
+  });
+
+  it("refreshLabel uses a pending journal instead of spending the dead keychain token", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })], (token) => {
+      if (token === "refresh-alice") throw new Error("Token refresh failed (400): invalid_grant");
+      throw new Error(`unexpected refresh with ${token}`);
+    });
+    writePendingJournal(h.journalPath);
+
+    const tokens = await h.manager.refreshLabel("alice");
+
+    assert.equal(tokens.refresh, "recovered-refresh");
+    assert.deepEqual(h.refreshCalls, []);
+    assert.equal(fs.existsSync(h.journalPath), false);
+  });
 });
+
+function writePendingJournal(journalPath: string): void {
+  fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+  fs.writeFileSync(
+    journalPath,
+    JSON.stringify({
+      label: "alice",
+      tokens: {
+        access: "recovered-access",
+        refresh: "recovered-refresh",
+        expires: NOW + 3_600_000,
+      },
+      writtenAt: NOW - 5_000,
+    }),
+  );
+}
 
 describe("rotation manager rotation", () => {
   it("a penalty applied after the switch keeps the new active account", async (t) => {

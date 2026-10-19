@@ -13,13 +13,13 @@
  *   claude-pool list
  */
 
-import { createRotationStateStore, defaultStatePath } from "../dist/pool/rotation-state.js";
+import { createRotationStateStore, defaultLockPath, defaultStatePath } from "../dist/pool/rotation-state.js";
 import { createAccountStore, createSecretBackend } from "../dist/pool/secret-store.js";
 import { enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew } from "../dist/pool/enroll.js";
 import { selectNext } from "../dist/pool/selection.js";
 
 const accounts = createAccountStore(createSecretBackend());
-const state = createRotationStateStore({ path: defaultStatePath() });
+const state = createRotationStateStore({ path: defaultStatePath(), lockPath: defaultLockPath() });
 
 /**
  * Register every enrolled account in the rotation state. The state file is

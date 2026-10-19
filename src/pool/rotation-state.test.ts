@@ -7,7 +7,9 @@ import type { TestContext } from "node:test";
 
 import {
   createRotationStateStore,
+  defaultLockPath,
   defaultRotationState,
+  defaultStatePath,
 } from "./rotation-state.js";
 import { ROTATION_STATE_VERSION } from "./types.js";
 import type { RotationState } from "./types.js";
@@ -248,5 +250,46 @@ describe("rotation state mutators", () => {
     await store.setActive("secondary");
 
     assert.equal(createRotationStateStore({ path: statePath }).load().activeLabel, "secondary");
+  });
+});
+
+describe("shared lock across relocated state files", () => {
+  it("serialises stores whose state files differ but whose lock is shared", async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "shared-lock-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    // The lock lives in a folder that does not exist yet.
+    const lockPath = path.join(root, "home", "data", "rotation-state.json.lock");
+    const a = createRotationStateStore({ path: path.join(root, "a", "state.json"), lockPath, lockPollMs: 1 });
+    const b = createRotationStateStore({ path: path.join(root, "b", "state.json"), lockPath, lockPollMs: 1 });
+
+    const events: string[] = [];
+    const first = a.withLock(async () => {
+      events.push("a-start");
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      events.push("a-end");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const second = b.withLock(() => {
+      events.push("b");
+    });
+    await Promise.all([first, second]);
+
+    assert.deepEqual(events, ["a-start", "a-end", "b"]);
+    assert.equal(fs.existsSync(lockPath), false);
+  });
+
+  it("keeps the default lock with the credentials when the state file is relocated", () => {
+    const saved = process.env.CLAUDE_POOL_STATE_PATH;
+    process.env.CLAUDE_POOL_STATE_PATH = "/tmp/elsewhere/state.json";
+    try {
+      assert.equal(defaultStatePath(), "/tmp/elsewhere/state.json");
+      assert.equal(
+        defaultLockPath(),
+        path.join(os.homedir(), ".local", "share", "opencode-claude-bridge", "rotation-state.json.lock"),
+      );
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_POOL_STATE_PATH;
+      else process.env.CLAUDE_POOL_STATE_PATH = saved;
+    }
   });
 });

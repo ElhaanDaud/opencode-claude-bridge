@@ -37,6 +37,7 @@ import { randomUUID } from "node:crypto";
 
 import { classify } from "./classifier.js";
 import { selectNext } from "./selection.js";
+import { LockTimeoutError } from "./rotation-state.js";
 import type { RotationStateStore } from "./rotation-state.js";
 import type { createAccountStore } from "./secret-store.js";
 import type {
@@ -198,19 +199,26 @@ export function createRotationManager(opts: ManagerOptions) {
    * before persisting. Without this, those tokens — the only valid ones,
    * because the server already invalidated their predecessors — would be lost.
    */
-  async function replayJournal(): Promise<boolean> {
+  // Caller must hold the lock, or another process can spend the dead keychain token.
+  async function commitPendingJournalLocked(): Promise<JournalEntry | null> {
     const entry = readJournal();
-    if (!entry) return false;
+    if (!entry) return null;
+    await accounts.updateTokens(entry.label, entry.tokens);
+    clearJournal();
+    console.error(
+      `[claude-pool] replayed pending refresh for "${entry.label}" from journal`,
+    );
+    return entry;
+  }
+
+  async function replayJournal(): Promise<boolean> {
+    // Cheap pre-check so the common case (no journal) costs no lock.
+    if (!readJournal()) return false;
     try {
-      await accounts.updateTokens(entry.label, entry.tokens);
-      clearJournal();
-      console.error(
-        `[claude-pool] replayed pending refresh for "${entry.label}" from journal`,
-      );
-      return true;
+      return (await state.withLock(commitPendingJournalLocked)) !== null;
     } catch (err) {
       console.error(
-        `[claude-pool] failed to replay refresh journal for "${entry.label}": ${
+        `[claude-pool] failed to replay refresh journal: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -256,6 +264,8 @@ export function createRotationManager(opts: ManagerOptions) {
 
     const task = (async (): Promise<PoolOAuthTokens> => {
       return state.withLock(async () => {
+        // Callers may reach this without going through acquire()'s journal replay.
+        await commitPendingJournalLocked();
         // Another process may have refreshed while we waited for the lock.
         // Re-read inside the critical section before burning our token.
         const current = await accounts.getAccount(label);
@@ -289,8 +299,9 @@ export function createRotationManager(opts: ManagerOptions) {
 
   /**
    * Pick an account and return a usable access token, refreshing if needed.
-   * Returns `exhausted` (never throws) when every account is cold, so the
-   * caller can fail fast with a precise, actionable message.
+   * Returns `exhausted` when every account is cold, so the caller can fail
+   * fast with a precise, actionable message. Throws LockTimeoutError only when
+   * the lock stays busy and no other account is usable.
    */
   async function acquire(exclude?: ReadonlySet<string>): Promise<AcquireResult> {
     await replayJournal();
@@ -330,26 +341,42 @@ export function createRotationManager(opts: ManagerOptions) {
         const fresh = await refreshLabel(label);
         record = { ...record, oauth: fresh };
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        // Only a rejected credential justifies permanent exclusion. A network
-        // blip or a 5xx from the token endpoint must cool the account down
-        // instead, or one transient outage disables every account in turn and
-        // wedges the pool with no automatic recovery.
-        if (isCredentialRejected(detail)) {
-          await state.markDisabled(label, `refresh rejected: ${detail}`);
-        } else {
-          await state.markCooldown(
-            label,
-            clock() + TRANSIENT_REFRESH_COOLDOWN_MS,
-            `refresh failed: ${detail}`,
-          );
+        if (!(err instanceof LockTimeoutError)) {
+          const detail = err instanceof Error ? err.message : String(err);
+          // Only a rejected credential justifies permanent exclusion. A network
+          // blip or a 5xx from the token endpoint must cool the account down
+          // instead, or one transient outage disables every account in turn and
+          // wedges the pool with no automatic recovery.
+          if (isCredentialRejected(detail)) {
+            await state.markDisabled(label, `refresh rejected: ${detail}`);
+          } else {
+            await state.markCooldown(
+              label,
+              clock() + TRANSIENT_REFRESH_COOLDOWN_MS,
+              `refresh failed: ${detail}`,
+            );
+          }
+          return acquire(exclude);
         }
-        return acquire(exclude);
+        // The lock holder is most likely refreshing this very account: use its
+        // result if it landed, else fail this request without blaming the account.
+        const reread = await accounts.getAccount(label);
+        if (!reread || !isFresh(reread.oauth, clock())) {
+          const alternative = await acquire(new Set([...(exclude ?? []), label]));
+          if (alternative.kind === "ok") return alternative;
+          throw err;
+        }
+        record = reread;
       }
     }
 
     if (state.load().activeLabel !== label) {
-      await state.setActive(label);
+      try {
+        await state.setActive(label);
+      } catch (err) {
+        // Stickiness only; a busy lock must not fail a request that has a valid token.
+        if (!(err instanceof LockTimeoutError)) throw err;
+      }
     }
     await mirror(record);
 
