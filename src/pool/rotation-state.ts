@@ -247,7 +247,9 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       moved = null;
     }
 
-    if (moved && moved.nonce !== observed.nonce) {
+    // Unparseable means a rival's lock caught between create and write, not
+    // the stale one we observed: restore it. Torn files age out in acquire().
+    if (!moved || moved.nonce !== observed.nonce) {
       // We moved a lock that had already been replaced — restore it.
       try { fs.renameSync(aside, lockPath); } catch { /* best effort */ }
       return false;

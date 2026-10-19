@@ -199,6 +199,48 @@ describe("rotation state locking", () => {
     assert.equal(JSON.parse(fs.readFileSync(`${statePath}.lock`, "utf8")).nonce, "held");
   });
 
+  it("never evicts a lock another waiter created but has not written yet", async (t) => {
+    const statePath = tempStatePath(t);
+    const lockPath = `${statePath}.lock`;
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({ pid: 123, hostname: "crashed-host", acquiredAt: 1_000, nonce: "stale" }),
+      { mode: 0o600 },
+    );
+
+    // Simulate a rival waiter winning the reclaim between our read of the stale
+    // lock and our rename: it has already replaced it with its own lockfile,
+    // opened but not yet written. Its later write lands on that same inode.
+    const realRename = fs.renameSync;
+    let rivalFd: number | undefined;
+    t.mock.method(fs, "renameSync", (src: fs.PathLike, dest: fs.PathLike) => {
+      if (rivalFd === undefined && src === lockPath) {
+        fs.rmSync(lockPath);
+        rivalFd = fs.openSync(lockPath, "wx", 0o600);
+        setTimeout(() => {
+          fs.writeSync(
+            rivalFd!,
+            JSON.stringify({ pid: process.pid, hostname: os.hostname(), acquiredAt: 40_001, nonce: "rival" }),
+          );
+          fs.closeSync(rivalFd!);
+        }, 20);
+      }
+      realRename(src, dest);
+    });
+
+    const store = createRotationStateStore({
+      path: statePath,
+      clock: () => 40_001,
+      staleLockMs: 30_000,
+      lockPollMs: 1,
+      lockTimeoutMs: 0,
+    });
+
+    await assert.rejects(store.withLock(() => {}), /timed out/);
+    assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).nonce, "rival");
+  });
+
   it("releases the lock and propagates when the callback throws", async (t) => {
     const statePath = tempStatePath(t);
     const store = createRotationStateStore({ path: statePath, lockPollMs: 1 });
