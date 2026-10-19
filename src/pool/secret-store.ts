@@ -34,6 +34,33 @@ async function runSecurity(args: string[]): Promise<string> {
   return stdout;
 }
 
+// `security -i` writes a TRUNCATED secret for lines over 4095 chars, then fails.
+const SECURITY_MAX_LINE = 4000;
+
+function quoteForSecurity(value: string): string {
+  if (/["\\\r\n]/.test(value)) {
+    throw new Error(`Unsupported character in keychain name "${value}"`);
+  }
+  return `"${value}"`;
+}
+
+/** Runs one `security` command read from stdin, keeping secrets out of argv. */
+function runSecurityCommand(line: string): Promise<void> {
+  if (line.length > SECURITY_MAX_LINE) {
+    return Promise.reject(new Error("keychain command exceeds the safe line length"));
+  }
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      "security",
+      ["-i"],
+      { timeout: SECURITY_TIMEOUT_MS, encoding: "utf8" },
+      (error) => (error ? reject(error) : resolve()),
+    );
+    child.stdin?.on("error", () => {}); // see runCurl: an early exit must not crash the process
+    child.stdin?.end(`${line}\n`);
+  });
+}
+
 function decodeDumpValue(value: string): string | null {
   try {
     return JSON.parse(value) as string;
@@ -42,19 +69,51 @@ function decodeDumpValue(value: string): string | null {
   }
 }
 
-function parseKeychainLabels(output: string, service: string): string[] {
+/**
+ * Decode the hex form `dump-keychain` uses when a value is not printable-ASCII
+ * safe, e.g. `0x796100  "ya\000"`. Matching only the quoted form made such
+ * items invisible to {@link parseKeychainLabels}, which silently dropped the
+ * account: never selected, then disabled as "credentials missing".
+ */
+function decodeDumpHex(hex: string): string | null {
+  if (hex.length === 0 || hex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    return null;
+  }
+  try {
+    const text = Buffer.from(hex, "hex").toString("utf8");
+    // A lone replacement char means the bytes were not valid UTF-8, so the
+    // decode is untrustworthy and a wrong label is worse than none.
+    return text.includes("\uFFFD") ? null : text;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read one `"<name>"<blob>=` attribute, accepting both emitted forms.
+ * The hex form may be followed by an escaped rendering, which is ignored.
+ */
+function readDumpAttribute(block: string, name: string): string | null {
+  const quoted = block.match(
+    new RegExp(`^\\s*"${name}"<blob>=("(?:[^"\\\\]|\\\\.)*")\\s*$`, "m"),
+  );
+  if (quoted) return decodeDumpValue(quoted[1]);
+
+  const hex = block.match(new RegExp(`^\\s*"${name}"<blob>=0x([0-9a-fA-F]+)`, "m"));
+  if (hex) return decodeDumpHex(hex[1]);
+
+  return null;
+}
+
+export function parseKeychainLabels(output: string, service: string): string[] {
   const labels = new Set<string>();
 
   // `dump-keychain` emits one item per `keychain:` block. Generic-password
   // attributes are lines such as `"svce"<blob>="..."` and
   // `"acct"<blob>="..."`; matching by attribute name avoids depending on order.
   for (const block of output.split(/(?=^keychain:)/m)) {
-    const serviceMatch = block.match(/^\s*"svce"<blob>=("(?:[^"\\]|\\.)*")\s*$/m);
-    const accountMatch = block.match(/^\s*"acct"<blob>=("(?:[^"\\]|\\.)*")\s*$/m);
-    if (!serviceMatch || !accountMatch) continue;
-
-    const itemService = decodeDumpValue(serviceMatch[1]);
-    const account = decodeDumpValue(accountMatch[1]);
+    const itemService = readDumpAttribute(block, "svce");
+    const account = readDumpAttribute(block, "acct");
     if (itemService === service && account !== null) labels.add(account);
   }
 
@@ -67,7 +126,7 @@ export function createKeychainBackend(
   return {
     async get(label: string): Promise<string | null> {
       try {
-        return await runSecurity([
+        const output = await runSecurity([
           "find-generic-password",
           "-s",
           service,
@@ -75,27 +134,21 @@ export function createKeychainBackend(
           label,
           "-w",
         ]);
-      } catch {
-        return null;
+        return output.endsWith("\n") ? output.slice(0, -1) : output;
+      } catch (error) {
+        // A locked keychain or timeout is not "missing": missing gets an account disabled.
+        if (isMissingKeychainItem(error)) return null;
+        throw new Error(`Failed to read keychain account "${label}"`);
       }
     },
 
     async set(label: string, value: string): Promise<void> {
       try {
-        await runSecurity([
-          "add-generic-password",
-          "-U",
-          "-s",
-          service,
-          "-a",
-          label,
-          "-l",
-          `${service}:${label}`,
-          "-D",
-          "Claude account pool entry",
-          "-w",
-          value,
-        ]);
+        const hex = Buffer.from(value, "utf8").toString("hex");
+        await runSecurityCommand(
+          `add-generic-password -U -s ${quoteForSecurity(service)} -a ${quoteForSecurity(label)}`
+            + ` -l ${quoteForSecurity(`${service}:${label}`)} -D "Claude account pool entry" -X ${hex}`,
+        );
       } catch {
         throw new Error(`Failed to store keychain account "${label}"`);
       }
@@ -295,8 +348,12 @@ export function createAccountStore(backend: SecretBackend) {
     async listAccounts(): Promise<AccountRecord[]> {
       const accounts: AccountRecord[] = [];
       for (const label of await backend.list()) {
-        const account = await getAccount(label);
-        if (account !== null) accounts.push(account);
+        try {
+          const account = await getAccount(label);
+          if (account !== null) accounts.push(account);
+        } catch (error) {
+          console.error(`[claude-pool] skipping "${label}": ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       return accounts;
     },

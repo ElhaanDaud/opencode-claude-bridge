@@ -310,7 +310,14 @@ export function createRotationManager(opts: ManagerOptions) {
     }
 
     const label = selection.label;
-    let record = await accounts.getAccount(label);
+    let record: AccountRecord | null;
+    try {
+      record = await accounts.getAccount(label);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      await state.markCooldown(label, clock() + TRANSIENT_REFRESH_COOLDOWN_MS, detail);
+      return acquire();
+    }
     if (!record) {
       // Enrolled in state but missing from the keychain: disable rather than
       // spin, so selection moves on instead of picking it again.

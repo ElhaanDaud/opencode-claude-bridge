@@ -7,6 +7,8 @@ import { describe, it } from "node:test";
 import {
   createAccountStore,
   createFileBackend,
+  createKeychainBackend,
+  parseKeychainLabels,
 } from "./secret-store.js";
 import type { AccountRecord, SecretBackend } from "./types.js";
 
@@ -44,6 +46,28 @@ const account: AccountRecord = {
   scopes: ["user:inference", "user:profile"],
   enrolledAt: 1_700_000_000_000,
 };
+
+describe("keychain dump parsing", () => {
+  const item = (svce: string, acct: string) =>
+    ['keychain: "/Users/x/Library/Keychains/login.keychain-db"', "attributes:", `    "acct"<blob>=${acct}`, `    "svce"<blob>=${svce}`].join("\n");
+  const hex = (text: string) => `0x${Buffer.from(text, "utf8").toString("hex").toUpperCase()}`;
+
+  it("reads quoted and hex-encoded attributes alike", () => {
+    // dump-keychain switches to hex for any non-ASCII value; those accounts
+    // were invisible to list() and then disabled as "credentials missing".
+    const output = [
+      item('"claude-pool"', '"alice"'),
+      item('"claude-pool"', `${hex("bob’s")}  "bob\\342\\200\\231s"`),
+      item(hex("claude-pool"), '"carol"'),
+      item('"other-service"', '"mallory"'),
+    ].join("\n");
+    assert.deepEqual(parseKeychainLabels(output, "claude-pool"), ["alice", "bob’s", "carol"]);
+  });
+
+  it("skips a hex value that is not valid UTF-8 rather than guessing", () => {
+    assert.deepEqual(parseKeychainLabels(item('"claude-pool"', "0xFF00FE"), "claude-pool"), []);
+  });
+});
 
 describe("account store", () => {
   it("round-trips every account field", async () => {
@@ -204,6 +228,36 @@ describe("file backend", () => {
       assert.equal(await backend.get("primary"), "new-value");
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("keychain backend (macOS only)", { skip: process.platform !== "darwin" }, () => {
+  const service = `opencode-bridge-test-${process.pid}-${Date.now()}`;
+
+  it("round-trips, updates, and reports absent items as missing", async () => {
+    const backend = createKeychainBackend(service);
+    const value = JSON.stringify({ token: `quote " apostrophe ' space`, n: 1 });
+    try {
+      assert.equal(await backend.get("acct"), null);
+      await backend.set("acct", value);
+      assert.equal(await backend.get("acct"), value);
+      await backend.set("acct", "second");
+      assert.equal(await backend.get("acct"), "second");
+    } finally {
+      await backend.remove("acct");
+    }
+    assert.equal(await backend.get("acct"), null);
+  });
+
+  it("refuses an oversized value rather than storing a truncated secret", async () => {
+    const backend = createKeychainBackend(service);
+    try {
+      await backend.set("big", "original");
+      await assert.rejects(backend.set("big", "x".repeat(4000)));
+      assert.equal(await backend.get("big"), "original");
+    } finally {
+      await backend.remove("big");
     }
   });
 });

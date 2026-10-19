@@ -217,6 +217,24 @@ describe("rotation manager token-endpoint firewall pages", () => {
   });
 });
 
+describe("rotation manager keychain read failures", () => {
+  it("cools an account whose credentials cannot be read, instead of disabling it", async (t) => {
+    const h = harness(t, [record("alice"), record("bob")]);
+    const originalGet = h.accounts.getAccount.bind(h.accounts);
+    h.accounts.getAccount = async (label) => {
+      if (label === "alice") throw new Error('Failed to read keychain account "alice"');
+      return originalGet(label);
+    };
+
+    const result = await h.manager.acquire();
+
+    assert.equal(result.kind === "ok" && result.label, "bob");
+    const alice = h.state.load().accounts.alice;
+    assert.equal(alice?.disabled, false);
+    assert.ok((alice?.cooldownUntil ?? 0) > NOW);
+  });
+});
+
 describe("rotation manager journal replay", () => {
   it("commits a journal left behind by a crashed process", async (t) => {
     const h = harness(t, [record("alice")]);
