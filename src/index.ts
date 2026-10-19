@@ -40,6 +40,7 @@ import { buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
 import { autoEnrollIfNew } from "./pool/enroll.js";
 import { createAccountStore, createSecretBackend } from "./pool/secret-store.js";
 import type { RotationManager } from "./pool/manager.js";
+import type { RotationDecision } from "./pool/types.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -510,6 +511,16 @@ function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> 
     }, ms);
     signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+export function failureSignature(status: number, bodyText: string): string {
+  try {
+    const parsed = JSON.parse(bodyText) as { error?: { type?: unknown; message?: unknown } };
+    if (parsed?.error && typeof parsed.error === "object") {
+      return `${status}|${String(parsed.error.type ?? "")}|${String(parsed.error.message ?? "")}`;
+    }
+  } catch {}
+  return `${status}|${bodyText.trim().slice(0, 500)}`;
 }
 
 /** Build deduplicated beta flags string. */
@@ -1070,6 +1081,17 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               const maxRotations = (await pool.listLabels()).length;
               let rotations = 0;
               let attempt = 0;
+              const tried = new Set<string>();
+              // 401/403 penalties wait until another account SUCCEEDS with the same
+              // request: an identical failure blames the request, and a 429 or 5xx
+              // from the next account says nothing about the first one.
+              const unconfirmed: Array<{ label: string; decision: RotationDecision; signature: string }> = [];
+              const confirmPenalties = async () => {
+                for (const { label, decision } of unconfirmed.splice(0)) {
+                  await pool.applyDecision(label, decision);
+                }
+              };
+              const unconfirmedLabels = () => unconfirmed.map((u) => `"${u.label}"`).join(", ");
 
               for (;;) {
                 const headers: Record<string, string> = {};
@@ -1099,7 +1121,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   attempt,
                 });
 
-                if (decision.action === "PASS_THROUGH") return rebuild();
+                if (decision.action === "PASS_THROUGH") {
+                  if (unconfirmed.length > 0) {
+                    console.error(
+                      `[claude-pool] no other account succeeded, so ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} not penalised`,
+                    );
+                  }
+                  return rebuild();
+                }
 
                 if (decision.action === "RETRY_SAME") {
                   attempt += 1;
@@ -1108,20 +1137,47 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   );
                   await abortableSleep(decision.backoffMs ?? 1000, init?.signal);
                   response = await doFetch();
-                  if (response.ok) break;
+                  if (response.ok) {
+                    await confirmPenalties();
+                    break;
+                  }
                   continue;
                 }
 
                 // ROTATE_COOLDOWN / ROTATE_DISABLE
-                console.error(
-                  `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
-                );
-                await pool.applyDecision(activeLabel, decision);
+                const signature = failureSignature(response.status, bodyText);
+                const repeated = unconfirmed.find((u) => u.signature === signature);
+                if (repeated) {
+                  console.error(
+                    `[claude-pool] "${repeated.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
+                  );
+                  return rebuild();
+                }
+                tried.add(activeLabel);
+
+                if (response.status === 401 || response.status === 403) {
+                  console.error(
+                    `[claude-pool] ${activeLabel}: ${decision.reason}; checking another account before penalising`,
+                  );
+                  unconfirmed.push({ label: activeLabel, decision, signature });
+                } else {
+                  console.error(
+                    `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
+                  );
+                  await pool.applyDecision(activeLabel, decision);
+                }
 
                 rotations += 1;
                 if (rotations > maxRotations) return rebuild();
 
-                const next = await pool.acquire();
+                const next = await pool.acquire(tried);
+                if (next.kind === "exhausted" && unconfirmed.length > 0) {
+                  // Unconfirmed disables need manual repair; surface the real error.
+                  console.error(
+                    `[claude-pool] no other account available to confirm ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} at fault; passing the error through without penalising`,
+                  );
+                  return rebuild();
+                }
                 if (next.kind === "exhausted") {
                   const message = pool.describeExhaustion(next.info);
                   console.error(`[claude-pool] ${message}`);
@@ -1145,7 +1201,10 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 attempt = 0;
                 console.error(`[claude-pool] now using account "${activeLabel}"`);
                 response = await doFetch();
-                if (response.ok) break;
+                if (response.ok) {
+                  await confirmPenalties();
+                  break;
+                }
               }
             }
 

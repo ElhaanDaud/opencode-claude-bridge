@@ -267,6 +267,22 @@ describe("rotation manager journal replay", () => {
 });
 
 describe("rotation manager rotation", () => {
+  it("a penalty applied after the switch keeps the new active account", async (t) => {
+    const h = harness(t, [record("alice"), record("bob")]);
+    await h.manager.acquire();
+    await h.manager.acquire(new Set(["alice"]));
+    assert.equal(h.state.load().activeLabel, "bob");
+
+    await h.manager.applyDecision("alice", {
+      action: "ROTATE_DISABLE",
+      reason: "credential rejected",
+      source: "status",
+    });
+
+    assert.equal(h.state.load().activeLabel, "bob");
+    assert.equal(h.state.load().accounts.alice?.disabled, true);
+  });
+
   it("rotates to the other account after a cooldown decision", async (t) => {
     const h = harness(t, [record("alice"), record("bob")]);
 

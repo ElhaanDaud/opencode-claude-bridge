@@ -20,6 +20,7 @@ import {
 import { extractOAuthErrorDetail } from "./oauth.js";
 import {
   deriveModelDisplayName,
+  failureSignature,
   getClaudeToolsForActiveOpenCodeTools,
   normalizeThinkingForSonnet55,
   rewriteSystemBlocksForModel,
@@ -1225,5 +1226,31 @@ describe("rewriteSystemBlocksForModel", () => {
     const out = rewriteSystemBlocksForModel(blocks, "claude-opus-4-7");
     assert.deepEqual(out[0], nonText);
     assert.equal(out[1].text, "no identity line here");
+  });
+});
+
+describe("failureSignature", () => {
+  const envelope = (message: string, requestId: string) =>
+    JSON.stringify({
+      type: "error",
+      error: { type: "authentication_error", message },
+      request_id: requestId,
+    });
+
+  it("treats the same error from different requests as identical", () => {
+    assert.equal(
+      failureSignature(401, envelope("OAuth authentication is currently not supported.", "req_A")),
+      failureSignature(401, envelope("OAuth authentication is currently not supported.", "req_B")),
+    );
+  });
+
+  it("distinguishes a different message or status", () => {
+    const base = failureSignature(403, envelope("no access to model", "req_A"));
+    assert.notEqual(base, failureSignature(403, envelope("account suspended", "req_A")));
+    assert.notEqual(base, failureSignature(401, envelope("no access to model", "req_A")));
+  });
+
+  it("falls back to the raw body when it is not an error envelope", () => {
+    assert.equal(failureSignature(403, "  <html>Forbidden</html> "), "403|<html>Forbidden</html>");
   });
 });

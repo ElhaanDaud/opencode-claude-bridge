@@ -13,9 +13,13 @@ function compareLabels(left: string, right: string): number {
   return 0;
 }
 
-export function selectNext(state: RotationState, now: number): SelectionResult {
+export function selectNext(
+  state: RotationState,
+  now: number,
+  exclude: ReadonlySet<string> = new Set(),
+): SelectionResult {
   const activeLabel = state.activeLabel;
-  if (activeLabel !== null) {
+  if (activeLabel !== null && !exclude.has(activeLabel)) {
     const active = state.accounts[activeLabel];
     if (active !== undefined && isAvailable(active, now)) {
       return { kind: "selected", label: activeLabel };
@@ -24,7 +28,7 @@ export function selectNext(state: RotationState, now: number): SelectionResult {
 
   const entries = Object.entries(state.accounts);
   const available = entries
-    .filter(([, account]) => isAvailable(account, now))
+    .filter(([label, account]) => !exclude.has(label) && isAvailable(account, now))
     .sort(([leftLabel, left], [rightLabel, right]) => {
       return (
         left.failureCount - right.failureCount ||

@@ -292,12 +292,12 @@ export function createRotationManager(opts: ManagerOptions) {
    * Returns `exhausted` (never throws) when every account is cold, so the
    * caller can fail fast with a precise, actionable message.
    */
-  async function acquire(): Promise<AcquireResult> {
+  async function acquire(exclude?: ReadonlySet<string>): Promise<AcquireResult> {
     await replayJournal();
     await sync();
 
     const now = clock();
-    const selection = selectNext(state.load(), now);
+    const selection = selectNext(state.load(), now, exclude);
     if (selection.kind === "exhausted") {
       return {
         kind: "exhausted",
@@ -316,13 +316,13 @@ export function createRotationManager(opts: ManagerOptions) {
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       await state.markCooldown(label, clock() + TRANSIENT_REFRESH_COOLDOWN_MS, detail);
-      return acquire();
+      return acquire(exclude);
     }
     if (!record) {
       // Enrolled in state but missing from the keychain: disable rather than
       // spin, so selection moves on instead of picking it again.
       await state.markDisabled(label, "credentials missing from keychain");
-      return acquire();
+      return acquire(exclude);
     }
 
     if (!isFresh(record.oauth, now)) {
@@ -344,7 +344,7 @@ export function createRotationManager(opts: ManagerOptions) {
             `refresh failed: ${detail}`,
           );
         }
-        return acquire();
+        return acquire(exclude);
       }
     }
 
@@ -368,6 +368,11 @@ export function createRotationManager(opts: ManagerOptions) {
     label: string,
     decision: RotationDecision,
   ): Promise<void> {
+    // Deferred penalties land after the pool has switched; don't clear the new pick.
+    const releaseIfActive = () =>
+      state.withLock((s) => {
+        if (s.activeLabel === label) s.activeLabel = null;
+      });
     switch (decision.action) {
       case "ROTATE_COOLDOWN":
         await state.markCooldown(
@@ -375,11 +380,11 @@ export function createRotationManager(opts: ManagerOptions) {
           decision.until ?? clock(),
           decision.reason,
         );
-        await state.setActive(null);
+        await releaseIfActive();
         break;
       case "ROTATE_DISABLE":
         await state.markDisabled(label, decision.reason);
-        await state.setActive(null);
+        await releaseIfActive();
         break;
       case "RETRY_SAME":
       case "PASS_THROUGH":

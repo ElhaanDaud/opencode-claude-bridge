@@ -180,3 +180,21 @@ describe("isAvailable", () => {
     );
   });
 });
+
+describe("selectNext exclusion", () => {
+  it("skips excluded accounts, including the active one", () => {
+    const result = selectNext(
+      state({ a: account(), b: account(), c: account() }, "a"),
+      NOW,
+      new Set(["a", "b"]),
+    );
+
+    assert.deepEqual(result, { kind: "selected", label: "c" });
+  });
+
+  it("reports exhaustion when every available account is excluded", () => {
+    const result = selectNext(state({ a: account() }, "a"), NOW, new Set(["a"]));
+
+    assert.equal(result.kind, "exhausted");
+  });
+});
