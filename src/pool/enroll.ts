@@ -13,6 +13,20 @@ const OAUTH_BETA = "oauth-2025-04-20";
 
 export class EnrollmentError extends Error {}
 
+/** The label is held by an account that may or may not be this one; only the user can decide. */
+export class LabelConflictError extends EnrollmentError {
+  constructor(
+    readonly label: string,
+    readonly existingEmail: string | null,
+  ) {
+    super(
+      existingEmail
+        ? `Label "${label}" already belongs to a different account (${existingEmail}). Choose another label or pass --replace.`
+        : `Label "${label}" belongs to an account whose email was never resolved; it may be this one. Pass --replace to overwrite it, or choose another label.`,
+    );
+  }
+}
+
 const MAX_LABEL_LENGTH = 64;
 
 /**
@@ -150,12 +164,27 @@ export async function lookupEmail(accessToken: string): Promise<string | undefin
   }
 }
 
+/** Same person, whatever their tokens: both copies' refresh tokens diverge after either refreshes. */
+function findByEmail(accounts: AccountRecord[], email: string | undefined): AccountRecord | undefined {
+  if (!email) return undefined;
+  const wanted = email.toLowerCase();
+  return accounts.find((a) => a.email?.toLowerCase() === wanted);
+}
+
+function firstFreeLabel(base: string, accounts: AccountRecord[]): string {
+  const taken = new Set(accounts.map((a) => a.label));
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(`${base}-${n}`)) n += 1;
+  return `${base}-${n}`;
+}
+
 export interface EnrollOptions {
   accounts: AccountStore;
   /** Optional: derived from the account's email when omitted. */
   label?: string;
   clock?: Clock;
-  resolveEmail?: boolean;
+  resolveEmail?: boolean | ((accessToken: string) => Promise<string | undefined>);
   readCredentials?: () => string;
   replace?: boolean;
 }
@@ -175,14 +204,20 @@ export async function enrollFromClaudeCli(
   const readCredentials = opts.readCredentials ?? readClaudeCliCredentialsRaw;
   const creds = parseClaudeCredentials(readCredentials());
 
+  const resolve = typeof opts.resolveEmail === "function" ? opts.resolveEmail : lookupEmail;
   const email =
     opts.resolveEmail === false
       ? undefined
-      : await lookupEmail(creds.claudeAiOauth.accessToken);
+      : await resolve(creds.claudeAiOauth.accessToken);
+
+  const existing = await opts.accounts.listAccounts();
+  const sameEmail = findByEmail(existing, email);
 
   let label: string;
   if (opts.label !== undefined) {
     label = normalizeLabel(opts.label);
+  } else if (sameEmail) {
+    label = sameEmail.label;
   } else if (email) {
     label = deriveLabelFromEmail(email);
   } else {
@@ -191,7 +226,12 @@ export async function enrollFromClaudeCli(
     );
   }
 
-  const existing = await opts.accounts.listAccounts();
+  if (sameEmail && sameEmail.label !== label) {
+    throw new EnrollmentError(
+      `${email} is already enrolled as "${sameEmail.label}". Enroll without a label to refresh its credentials.`,
+    );
+  }
+
   const duplicate = existing.find(
     (a) => a.oauth.refresh === creds.claudeAiOauth.refreshToken,
   );
@@ -202,17 +242,47 @@ export async function enrollFromClaudeCli(
   }
 
   const sameLabelDifferentAccount = existing.find(
-    (a) => a.label === label && a.oauth.refresh !== creds.claudeAiOauth.refreshToken,
+    (a) => a.label === label
+      && a !== sameEmail
+      && a.oauth.refresh !== creds.claudeAiOauth.refreshToken,
   );
   if (sameLabelDifferentAccount && opts.replace !== true) {
-    throw new EnrollmentError(
-      `Label "${label}" already belongs to a different account (${sameLabelDifferentAccount.email ?? "unknown email"}). Choose another label or pass --replace.`,
-    );
+    const derived = opts.label === undefined;
+    const otherPerson = Boolean(email && sameLabelDifferentAccount.email);
+    if (derived && otherPerson) {
+      // alice@work and alice@home derive the same label; both belong in the pool.
+      label = firstFreeLabel(label, existing);
+    } else {
+      throw new LabelConflictError(label, sameLabelDifferentAccount.email ?? null);
+    }
   }
 
   const record = toAccountRecord(label, creds, now, email);
   await opts.accounts.putAccount(record);
   return record;
+}
+
+/**
+ * Label of the pooled account holding Claude Code's current refresh token, if
+ * any. Refresh tokens are single-use, so whichever side refreshes first logs
+ * the other out. Compares only; never returns or logs a token.
+ */
+export async function labelSharingClaudeCliLogin(
+  accounts: AccountStore,
+  readCredentials: () => string = readClaudeCliCredentialsRaw,
+): Promise<string | null> {
+  let refresh: string;
+  try {
+    refresh = parseClaudeCredentials(readCredentials()).claudeAiOauth.refreshToken;
+  } catch {
+    return null;
+  }
+  return (await accounts.listAccounts()).find((a) => a.oauth.refresh === refresh)?.label ?? null;
+}
+
+export function sharedLoginWarning(label: string): string {
+  return `"${label}" shares one login with Claude Code on this machine; whichever refreshes first logs the other out. `
+    + "Run `claude login` again (as this or another account) and do not re-enroll it.";
 }
 
 export type AutoEnrollStatus =
@@ -239,9 +309,9 @@ export interface AutoEnrollOptions {
  * Adopt whatever account the Claude CLI is currently logged into, if the pool
  * has not seen it before.
  *
- * Accounts are matched by refresh token rather than by label, because the same
- * person may re-login and receive different tokens, and two different accounts
- * may derive the same label from their email.
+ * Accounts are matched by refresh token, then by email: the pool's copy and
+ * the CLI's copy stop sharing a refresh token once either refreshes. Never by
+ * label, since two different accounts may derive the same one.
  *
  * Never throws: this runs during plugin startup, where a failure to adopt a new
  * account must not prevent the existing pool from serving requests.
@@ -284,6 +354,9 @@ export async function autoEnrollIfNew(
   }
   if (!email) return { status: "no-label" };
 
+  const sameEmail = findByEmail(existing, email);
+  if (sameEmail) return { status: "already-enrolled", label: sameEmail.label, email };
+
   let label: string;
   try {
     label = deriveLabelFromEmail(email);
@@ -291,12 +364,7 @@ export async function autoEnrollIfNew(
     return { status: "no-label" };
   }
 
-  const taken = new Set(existing.map((a) => a.label));
-  if (taken.has(label)) {
-    let n = 2;
-    while (taken.has(`${label}-${n}`)) n += 1;
-    label = `${label}-${n}`;
-  }
+  label = firstFreeLabel(label, existing);
 
   try {
     await opts.accounts.putAccount(toAccountRecord(label, creds, now, email));

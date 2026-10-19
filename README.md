@@ -185,8 +185,9 @@ hook so `claude login` enrolls as it completes:
 node scripts/claude-pool.mjs install-hook >> ~/.zshrc && source ~/.zshrc
 ```
 
-Accounts are matched by refresh token, so re-logging into a pooled account is
-never duplicated. Set `CLAUDE_POOL_AUTO_ENROLL=0` to disable.
+Accounts are matched by refresh token, then by email, so re-logging into a
+pooled account refreshes its entry instead of duplicating it. Set
+`CLAUDE_POOL_AUTO_ENROLL=0` to disable.
 
 ### Commands
 

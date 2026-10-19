@@ -3,12 +3,15 @@ import { describe, it } from "node:test";
 
 import {
   EnrollmentError,
+  LabelConflictError,
   deriveLabelFromEmail,
   normalizeLabel,
   autoEnrollIfNew,
   parseClaudeCredentials,
   toAccountRecord,
   enrollFromClaudeCli,
+  labelSharingClaudeCliLogin,
+  sharedLoginWarning,
 } from "./enroll.js";
 import { createAccountStore } from "./secret-store.js";
 import type { SecretBackend } from "./types.js";
@@ -184,6 +187,133 @@ describe("duplicate enrollment", () => {
   });
 });
 
+describe("re-enrolling after a re-login", () => {
+  const relogin = JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "sk-ant-oat01-new",
+      refreshToken: "sk-ant-ort01-new",
+      expiresAt: NOW + 3_600_000,
+      subscriptionType: "max",
+    },
+  });
+
+  it("refreshes the existing entry for the same email instead of refusing", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW - 5000, "alice@example.com"),
+    );
+
+    const record = await enrollFromClaudeCli({
+      accounts: store,
+      clock: () => NOW,
+      resolveEmail: async () => "alice@example.com",
+      readCredentials: () => relogin,
+    });
+
+    assert.equal(record.label, "alice");
+    const accounts = await store.listAccounts();
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]?.oauth.refresh, "sk-ant-ort01-new");
+  });
+
+  it("refuses a second label for an email that is already enrolled", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, "alice@example.com"),
+    );
+
+    await assert.rejects(
+      enrollFromClaudeCli({
+        accounts: store,
+        label: "work",
+        clock: () => NOW,
+        resolveEmail: async () => "alice@example.com",
+        readCredentials: () => relogin,
+      }),
+      (err: Error) => err instanceof EnrollmentError && /already enrolled as "alice"/.test(err.message),
+    );
+    assert.equal((await store.listAccounts()).length, 1);
+  });
+});
+
+describe("label collisions", () => {
+  const other = JSON.stringify({
+    claudeAiOauth: {
+      accessToken: "sk-ant-oat01-other",
+      refreshToken: "sk-ant-ort01-other",
+      expiresAt: NOW + 3_600_000,
+    },
+  });
+
+  async function storeWithAlice(email?: string) {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, email));
+    return store;
+  }
+
+  it("gives a different person who derives the same label a free suffix", async () => {
+    const store = await storeWithAlice("alice@work.io");
+
+    const record = await enrollFromClaudeCli({
+      accounts: store,
+      clock: () => NOW,
+      resolveEmail: async () => "alice@home.io",
+      readCredentials: () => other,
+    });
+
+    assert.equal(record.label, "alice-2");
+    assert.equal((await store.listAccounts()).length, 2);
+  });
+
+  it("asks before overwriting a label whose owner's email is unknown", async () => {
+    const store = await storeWithAlice();
+
+    await assert.rejects(
+      enrollFromClaudeCli({
+        accounts: store,
+        clock: () => NOW,
+        resolveEmail: async () => "alice@home.io",
+        readCredentials: () => other,
+      }),
+      (err: Error) => err instanceof LabelConflictError && err.label === "alice" && err.existingEmail === null,
+    );
+    assert.equal((await store.listAccounts())[0]?.oauth.refresh, "sk-ant-ort01-xyz");
+  });
+
+  it("still refuses an explicit label that belongs to someone else", async () => {
+    const store = await storeWithAlice("alice@work.io");
+
+    await assert.rejects(
+      enrollFromClaudeCli({
+        accounts: store,
+        label: "alice",
+        clock: () => NOW,
+        resolveEmail: async () => "alice@home.io",
+        readCredentials: () => other,
+      }),
+      (err: Error) => err instanceof LabelConflictError && err.existingEmail === "alice@work.io",
+    );
+  });
+
+  it("overwrites the conflicting label when replace is set", async () => {
+    const store = await storeWithAlice();
+
+    const record = await enrollFromClaudeCli({
+      accounts: store,
+      label: "alice",
+      replace: true,
+      clock: () => NOW,
+      resolveEmail: async () => "alice@home.io",
+      readCredentials: () => other,
+    });
+
+    assert.equal(record.label, "alice");
+    const accounts = await store.listAccounts();
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]?.oauth.refresh, "sk-ant-ort01-other");
+  });
+});
+
 describe("automatic enrollment", () => {
   const cli = (refresh: string, expiresInMs = 3_600_000) =>
     JSON.stringify({
@@ -272,6 +402,24 @@ describe("automatic enrollment", () => {
     assert.equal((await store.listAccounts()).length, 2);
   });
 
+  it("recognises the same account by email after the tokens have diverged", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, "Alice@Example.com"),
+    );
+
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => cli("sk-ant-ort01-rotated"),
+      resolveEmail: async () => "alice@example.com",
+    });
+
+    assert.equal(result.status, "already-enrolled");
+    assert.equal(result.label, "alice");
+    assert.equal((await store.listAccounts()).length, 1);
+  });
+
   it("skips accounts whose email cannot be resolved", async () => {
     const store = createAccountStore(memoryBackend());
     const result = await autoEnrollIfNew({
@@ -283,5 +431,34 @@ describe("automatic enrollment", () => {
 
     assert.equal(result.status, "no-label");
     assert.equal((await store.listAccounts()).length, 0);
+  });
+});
+
+describe("shared login detection", () => {
+  it("names the pooled account that holds Claude Code's current refresh token", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW));
+
+    assert.equal(await labelSharingClaudeCliLogin(store, () => VALID_CLI_JSON), "alice");
+  });
+
+  it("reports nothing once Claude Code has its own login", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW));
+    const separate = VALID_CLI_JSON.replace("sk-ant-ort01-xyz", "sk-ant-ort01-separate");
+
+    assert.equal(await labelSharingClaudeCliLogin(store, () => separate), null);
+  });
+
+  it("reports nothing when Claude Code is not logged in", async () => {
+    const store = createAccountStore(memoryBackend());
+    const missing = () => {
+      throw new EnrollmentError("no credentials");
+    };
+    assert.equal(await labelSharingClaudeCliLogin(store, missing), null);
+  });
+
+  it("never includes a token in the warning", () => {
+    assert.ok(!sharedLoginWarning("alice").includes("sk-ant"));
   });
 });
