@@ -1,11 +1,16 @@
-# macOS setup guide
+# Setup guide
 
-End-to-end setup for running this fork with multi-account rotation on macOS.
+End-to-end setup for running this fork with multi-account rotation on macOS
+and Linux.
 
 Everything below was verified on macOS (Apple Silicon), Node v26, OpenCode
-1.18.x, Claude CLI 2.x. Where a step exists because of a non-obvious failure
-mode, the reason is stated — those are the steps people skip and then spend an
-hour debugging.
+1.18.x, Claude CLI 2.x. The Linux steps follow the same code paths the bridge
+uses off-macOS — credentials in files instead of the login Keychain — but they
+have not been through an end-to-end run for this document, so treat macOS as
+the verified platform. Steps that differ by platform are marked **(macOS)** or
+**(Linux)**; everything else is identical on both. Where a step exists because
+of a non-obvious failure mode, the reason is stated — those are the steps
+people skip and then spend an hour debugging.
 
 ---
 
@@ -13,7 +18,7 @@ hour debugging.
 
 | Requirement | Why | Check |
 | --- | --- | --- |
-| macOS | Credentials are stored in the login Keychain via `security(1)` | `sw_vers -productName` |
+| macOS or Linux | Credential storage differs by platform: macOS uses the login Keychain via `security(1)`; Linux uses files (`~/.claude/.credentials.json` for the CLI, `~/.local/share/opencode-claude-bridge/accounts/` for the pool) | `uname -s` (Linux: `cat /etc/os-release`) |
 | Node 20+ | The plugin is ESM and the test runner uses glob patterns | `node --version` |
 | OpenCode | The host application | `opencode --version` |
 | Claude CLI | Source of OAuth credentials for enrollment | `claude --version` |
@@ -65,6 +70,9 @@ EOF
 ```
 
 Use an absolute path — `~` is not expanded inside the module specifier.
+Replace the placeholder with your home directory (`/Users/...` on macOS,
+`/home/...` on Linux); `realpath dist/index.js` from the repo root prints the
+correct form.
 
 Confirm the wrapper exposes exactly one export:
 
@@ -88,7 +96,8 @@ In `~/.config/opencode/opencode.json`:
 }
 ```
 
-The `file://` prefix and an absolute path are both required.
+The `file://` prefix and an absolute path are both required (`file:///home/<you>/...`
+on Linux — the JSON above shows the macOS form).
 
 Do **not** add an `anthropic` provider block. The bridge registers that
 provider itself and owns the transport; a manual block competes with it.
@@ -99,10 +108,11 @@ provider itself and owns the transport; a manual block competes with it.
 
 ### Why the order matters
 
-Both the Claude CLI keychain and OpenCode's `auth.json` hold exactly **one**
-Claude credential. Running `claude login` for a second account **destroys the
-first account's credentials**. Enrollment copies the current account into the
-pool first, which makes the cycle repeatable.
+Both the Claude CLI's stored credential (the login Keychain on macOS,
+`~/.claude/.credentials.json` on Linux) and OpenCode's `auth.json` hold exactly
+**one** Claude credential. Running `claude login` for a second account
+**destroys the first account's credentials**. Enrollment copies the current
+account into the pool first, which makes the cycle repeatable.
 
 Losing a credential this way is unrecoverable — the account must be logged in
 again from scratch.
@@ -113,8 +123,10 @@ Install the `claude-pool` command first (this also installs the auto-enroll
 hook described in the next section):
 
 ```bash
-node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc
-source ~/.zshrc
+# zsh
+node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc && source ~/.zshrc
+# bash — the default on most Linux distros
+node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.bashrc && source ~/.bashrc
 ```
 
 Then:
@@ -146,8 +158,10 @@ into an account the pool has not seen, and adopts it. Nothing to run.
 hook:
 
 ```bash
-node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc
-source ~/.zshrc
+# zsh
+node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.zshrc && source ~/.zshrc
+# bash — the default on most Linux distros
+node ~/src/opencode-claude-bridge/scripts/claude-pool.mjs install-hook >> ~/.bashrc && source ~/.bashrc
 ```
 
 That defines a `claude-pool` shell function and wraps `claude`, so the full
@@ -187,8 +201,14 @@ LABEL     EMAIL                      TIER   STATUS   TOKEN EXPIRES
 * = active account (mirrored into opencode's anthropic slot)
 ```
 
-The first Keychain write may prompt for your login password. Choose **Always
-Allow** if you do not want to be prompted on every rotation.
+**(macOS)** The first Keychain write may prompt for your login password.
+Choose **Always Allow** if you do not want to be prompted on every rotation.
+
+**(Linux)** There is no prompt: the pool creates
+`~/.local/share/opencode-claude-bridge/accounts/` as `0700` with one `0600`
+file per account. Those files hold live refresh tokens in plaintext, so home
+directory encryption (LUKS, an encrypted home volume) is what protects them at
+rest.
 
 ---
 
@@ -222,16 +242,25 @@ node scripts/qa-rotation.mjs
 
 | Path | Contents | Mode |
 | --- | --- | --- |
-| Keychain service `opencode-claude-bridge` | One item per enrolled account (the pool; source of truth) | OS-encrypted |
-| Keychain service `Claude Code-credentials` | The Claude CLI's own single credential | OS-encrypted |
+| **(macOS)** Keychain service `opencode-claude-bridge` / **(Linux)** `~/.local/share/opencode-claude-bridge/accounts/<label>.json` | One item/file per enrolled account (the pool; source of truth) | OS-encrypted / `0600` in a `0700` dir |
+| **(macOS)** Keychain service `Claude Code-credentials` / **(Linux)** `~/.claude/.credentials.json` | The Claude CLI's own single credential | OS-encrypted / written by the CLI |
 | `~/.local/share/opencode/auth.json` | OpenCode's single `anthropic` slot — a mirror of the active account | `0600` |
 | `~/.local/share/opencode-claude-bridge/rotation-state.json` | Active account, cooldowns, failure counts. No secrets | `0600` |
 | `~/.local/share/opencode-claude-bridge/refresh-journal.json` | Transient; exists only mid-refresh | `0600` |
 
+If `CLAUDE_CONFIG_DIR` is set, the Claude CLI credential lives at
+`$CLAUDE_CONFIG_DIR/.credentials.json` instead of `~/.claude/` — the bridge
+honors the variable on both platforms.
+
 Inspect the pool without exposing secrets:
 
 ```bash
+# macOS — labels only, no token material
 security find-generic-password -s opencode-claude-bridge -a <label> | grep acct
+# Linux — the account labels are the file names; do not cat them casually,
+# each file contains live tokens
+ls -l ~/.local/share/opencode-claude-bridge/accounts/
+
 cat ~/.local/share/opencode-claude-bridge/rotation-state.json
 ```
 
@@ -299,10 +328,17 @@ claude-pool list
 With fewer than two usable accounts there is nowhere to rotate. Accounts marked
 `DISABLED` are excluded until re-enrolled.
 
-### Keychain prompts on every rotation
+### Keychain prompts on every rotation (macOS)
 
 Open **Keychain Access**, find the `opencode-claude-bridge` items, and set
 Access Control to always allow `security`.
+
+### `No Claude CLI credentials found at ~/.claude/.credentials.json` (Linux)
+
+Enrollment reads the CLI's credential from that file off-macOS. Either
+`claude login` has not been run, or `CLAUDE_CONFIG_DIR` points somewhere else —
+when the variable is set, the bridge reads
+`$CLAUDE_CONFIG_DIR/.credentials.json` instead.
 
 ---
 
@@ -315,7 +351,8 @@ npm ci && npm run build
 ```
 
 Restart OpenCode. Enrolled accounts survive upgrades — they live in the
-Keychain, not in the repo.
+Keychain (macOS) or `~/.local/share/opencode-claude-bridge/accounts/` (Linux),
+not in the repo.
 
 ---
 
@@ -333,6 +370,10 @@ rm -rf ~/.local/share/opencode-claude-bridge
 rm ~/.config/opencode/claude-bridge-wrapper.mjs
 ```
 
+**(Linux)** the `rm -rf` above already removes the pool: enrolled accounts
+live inside `~/.local/share/opencode-claude-bridge/accounts/`. On macOS they
+live in the Keychain, which is why the `claude-pool remove` step matters there.
+
 Removing accounts from the pool does **not** log you out of Claude. The Claude
 CLI keeps its own credential, and `~/.local/share/opencode/auth.json` keeps
 whichever account was last mirrored — delete its `anthropic` entry if you want
@@ -342,10 +383,12 @@ OpenCode to forget it too.
 
 ## 10. Safety notes
 
-- The pool stores live refresh tokens. Treat a Keychain export as equivalent to
-  full account access.
-- Do not commit `auth.json`, `rotation-state.json`, or any credential snapshot.
-- Avoid keeping plaintext copies of credentials; the Keychain already holds them
-  encrypted at rest.
+- The pool stores live refresh tokens. Treat a Keychain export (macOS) or a copy
+  of `accounts/*.json` (Linux) as equivalent to full account access.
+- Do not commit `auth.json`, `rotation-state.json`, `accounts/`, or any
+  credential snapshot.
+- Avoid keeping plaintext copies of credentials. On macOS the Keychain holds
+  them encrypted at rest; on Linux the pool files are plaintext `0600`, so
+  full-disk encryption is what protects them.
 - Rotation only reads a failed response body before streaming begins, so no
   request content is buffered or logged. Tokens are never written to logs.

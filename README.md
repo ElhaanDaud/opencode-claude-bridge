@@ -146,7 +146,7 @@ The salt is hardcoded in Claude Code's source. This changes per conversation bec
 
 ## Multi-account rotation
 
-> macOS setup, enrollment order and troubleshooting: **[SETUP.md](SETUP.md)**
+> Setup (macOS and Linux), enrollment order and troubleshooting: **[SETUP.md](SETUP.md)**
 
 A single Claude subscription has a rolling 5-hour window and a rolling 7-day
 quota. When either is spent, every request fails until it resets. The account
