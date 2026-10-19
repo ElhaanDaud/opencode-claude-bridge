@@ -15,9 +15,14 @@ interface KeychainCredentials {
   };
 }
 
+/** Where the Claude CLI stores its login outside the macOS keychain (Linux, Windows). */
+export function claudeCredentialsPath(): string {
+  return join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), ".credentials.json");
+}
+
 /**
  * Read Claude CLI credentials from macOS Keychain.
- * Falls back to ~/.claude/.credentials.json on other platforms.
+ * Falls back to the credentials file on other platforms.
  */
 export function readClaudeCredentials(): KeychainCredentials | null {
   if (process.platform === "darwin") {
@@ -36,8 +41,7 @@ export function readClaudeCredentials(): KeychainCredentials | null {
 
   // Fallback: credentials file
   try {
-    const credPath = join(homedir(), ".claude", ".credentials.json");
-    const raw = readFileSync(credPath, "utf8");
+    const raw = readFileSync(claudeCredentialsPath(), "utf8");
     return JSON.parse(raw) as KeychainCredentials;
   } catch {
     return null;

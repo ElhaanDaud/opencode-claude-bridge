@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
+import type { TestContext } from "node:test";
 
 import {
   EnrollmentError,
@@ -8,6 +12,7 @@ import {
   normalizeLabel,
   autoEnrollIfNew,
   parseClaudeCredentials,
+  readClaudeCliCredentialsRaw,
   toAccountRecord,
   enrollFromClaudeCli,
   labelSharingClaudeCliLogin,
@@ -233,6 +238,37 @@ describe("re-enrolling after a re-login", () => {
       (err: Error) => err instanceof EnrollmentError && /already enrolled as "alice"/.test(err.message),
     );
     assert.equal((await store.listAccounts()).length, 1);
+  });
+});
+
+describe("reading the Claude CLI login off macOS", () => {
+  function onLinux(t: TestContext, credentials: string | null): string {
+    const dir = mkdtempSync(join(tmpdir(), "claude-config-"));
+    if (credentials !== null) writeFileSync(join(dir, ".credentials.json"), credentials);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const configDir = process.env.CLAUDE_CONFIG_DIR;
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    process.env.CLAUDE_CONFIG_DIR = dir;
+    t.after(() => {
+      Object.defineProperty(process, "platform", platform);
+      if (configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = configDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+    return dir;
+  }
+
+  it("reads the credentials file Claude Code writes on Linux", (t) => {
+    onLinux(t, `${VALID_CLI_JSON}\n`);
+    assert.equal(readClaudeCliCredentialsRaw(), VALID_CLI_JSON);
+  });
+
+  it("explains where it looked when there is no login", (t) => {
+    const dir = onLinux(t, null);
+    assert.throws(
+      () => readClaudeCliCredentialsRaw(),
+      (err: Error) => err instanceof EnrollmentError && err.message.includes(dir) && /claude login/.test(err.message),
+    );
   });
 });
 

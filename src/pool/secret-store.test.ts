@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -211,6 +211,34 @@ describe("file backend", () => {
       assert.deepEqual(readdirSync(dir), []);
     } finally {
       rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a store that was never written as empty, without creating it", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "secret-store-empty-"));
+    const dir = join(parent, "accounts");
+
+    try {
+      const backend = createFileBackend(dir);
+      assert.deepEqual(await backend.list(), []);
+      assert.equal(await backend.get("primary"), null);
+      assert.deepEqual(readdirSync(parent), []);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("can be created under an unwritable home, failing only on write", { skip: process.getuid?.() === 0 }, async () => {
+    const home = mkdtempSync(join(tmpdir(), "secret-store-readonly-"));
+    chmodSync(home, 0o500);
+
+    try {
+      const backend = createFileBackend(join(home, ".local", "share", "accounts"));
+      assert.deepEqual(await backend.list(), []);
+      await assert.rejects(backend.set("primary", "secret"));
+    } finally {
+      chmodSync(home, 0o700);
+      rmSync(home, { recursive: true, force: true });
     }
   });
 

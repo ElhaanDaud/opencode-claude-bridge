@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 import type {
   AccountRecord,
@@ -7,6 +8,7 @@ import type {
 } from "./types.js";
 import type { AccountStore } from "./manager.js";
 import { PROFILE_URL } from "../constants.js";
+import { claudeCredentialsPath } from "../keychain.js";
 
 const CLAUDE_CLI_KEYCHAIN_SERVICE = "Claude Code-credentials";
 const OAUTH_BETA = "oauth-2025-04-20";
@@ -123,9 +125,14 @@ export function toAccountRecord(
 
 export function readClaudeCliCredentialsRaw(): string {
   if (process.platform !== "darwin") {
-    throw new EnrollmentError(
-      "Snapshot enrollment currently reads the macOS keychain only",
-    );
+    const path = claudeCredentialsPath();
+    try {
+      return readFileSync(path, "utf8").trim();
+    } catch {
+      throw new EnrollmentError(
+        `No Claude CLI credentials found at ${path}. Run \`claude login\` first.`,
+      );
+    }
   }
   try {
     return execFileSync(

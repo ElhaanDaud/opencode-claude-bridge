@@ -178,6 +178,27 @@ describe("rotation state locking", () => {
     assert.equal(fs.existsSync(`${statePath}.lock`), false);
   });
 
+  it("never reclaims an old lock whose holder is alive under another user", async (t) => {
+    const statePath = tempStatePath(t);
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    // pid 1 always exists; signalling it as a normal user fails with EPERM.
+    fs.writeFileSync(
+      `${statePath}.lock`,
+      JSON.stringify({ pid: 1, hostname: os.hostname(), acquiredAt: 1_000, nonce: "held" }),
+      { mode: 0o600 },
+    );
+    const store = createRotationStateStore({
+      path: statePath,
+      clock: () => 40_001,
+      staleLockMs: 30_000,
+      lockPollMs: 1,
+      lockTimeoutMs: 0,
+    });
+
+    await assert.rejects(store.withLock(() => {}), /timed out/);
+    assert.equal(JSON.parse(fs.readFileSync(`${statePath}.lock`, "utf8")).nonce, "held");
+  });
+
   it("releases the lock and propagates when the callback throws", async (t) => {
     const statePath = tempStatePath(t);
     const store = createRotationStateStore({ path: statePath, lockPollMs: 1 });

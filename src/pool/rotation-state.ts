@@ -226,8 +226,9 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     try {
       process.kill(payload.pid, 0);
       return false;
-    } catch {
-      return true;
+    } catch (error) {
+      // EPERM: the process exists but belongs to another user (e.g. a service account).
+      return (error as NodeJS.ErrnoException).code !== "EPERM";
     }
   }
 

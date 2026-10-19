@@ -220,8 +220,12 @@ async function syncDirectory(dir: string): Promise<void> {
 }
 
 export function createFileBackend(dir: string): SecretBackend {
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  chmodSync(dir, 0o700);
+  // Created on first write, not here: this runs while the plugin loads, and an
+  // unwritable home must leave the pool inactive rather than fail the load.
+  const ensureDir = () => {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+  };
 
   return {
     async get(label: string): Promise<string | null> {
@@ -235,6 +239,7 @@ export function createFileBackend(dir: string): SecretBackend {
     },
 
     async set(label: string, value: string): Promise<void> {
+      ensureDir();
       const target = join(dir, fileNameForLabel(label));
       const temporary = join(
         dir,
@@ -271,7 +276,13 @@ export function createFileBackend(dir: string): SecretBackend {
     },
 
     async list(): Promise<string[]> {
-      const entries = await fs.readdir(dir);
+      let entries: string[];
+      try {
+        entries = await fs.readdir(dir);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      }
       return entries
         .map(labelFromFileName)
         .filter((label): label is string => label !== null)
