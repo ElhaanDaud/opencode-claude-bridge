@@ -4,41 +4,45 @@ Use your Claude Pro/Max subscription in [OpenCode](https://opencode.ai). If you'
 
 ## Install
 
-Add to `~/.config/opencode/opencode.json`:
+This fork is installed from source. The `opencode-claude-bridge` package on
+npm is the upstream project and does not include the account pool.
 
-```json
-{
-  "plugin": ["opencode-claude-bridge"]
-}
-```
-
-OpenCode auto-installs the plugin from npm on next launch.
-
-If you're logged into the Claude CLI (`claude login`), the plugin auto-syncs your credentials — just select an Anthropic model and start chatting. If not, you'll be prompted to authenticate via browser OAuth or enter an API key.
-
-**Upgrade:**
-
-OpenCode pins the installed version. To upgrade to the latest:
+**1. Clone and build**
 
 ```bash
-cd ~/.cache/opencode && npm install opencode-claude-bridge@latest
+git clone https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
+cd ~/src/opencode-claude-bridge && npm ci && npm run build
 ```
 
-Then restart OpenCode.
-
-<details>
-<summary>Install from source</summary>
-
-```bash
-git clone https://github.com/dotCipher/opencode-claude-bridge.git ~/opencode-claude-bridge
-cd ~/opencode-claude-bridge && npm install && npm run build
-```
+**2. Create a wrapper**
 
 Don't point OpenCode at `dist/index.js` directly. The loader calls every named
 export as a plugin factory, and this module exports helpers, so loading fails
-with `modelId.match is not a function`. Use a one-line wrapper that re-exports
-only the default instead. See [SETUP.md §3](SETUP.md#3-register-the-plugin).
-</details>
+with `modelId.match is not a function`. A wrapper that re-exports only the
+default avoids that:
+
+```bash
+echo "export { default } from \"$HOME/src/opencode-claude-bridge/dist/index.js\";" \
+  > ~/.config/opencode/claude-bridge-wrapper.mjs
+```
+
+**3. Register it** in `~/.config/opencode/opencode.json` (use your absolute home path):
+
+```json
+{
+  "plugin": ["file:///Users/YOU/.config/opencode/claude-bridge-wrapper.mjs"]
+}
+```
+
+Restart OpenCode. If you're logged into the Claude CLI (`claude login`), the plugin auto-syncs your credentials — just select an Anthropic model and start chatting. If not, you'll be prompted to authenticate via browser OAuth or enter an API key.
+
+**Upgrade:**
+
+```bash
+cd ~/src/opencode-claude-bridge && git pull && npm ci && npm run build
+```
+
+Then restart OpenCode. Full walkthrough, Linux notes and troubleshooting: [SETUP.md](SETUP.md).
 
 ## How the bridge works
 

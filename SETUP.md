@@ -32,7 +32,7 @@ account enrolled the pool works but has nowhere to rotate to.
 ## 2. Clone and build
 
 ```bash
-git clone https://github.com/<you>/opencode-claude-bridge.git ~/src/opencode-claude-bridge
+git clone https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
 cd ~/src/opencode-claude-bridge
 npm ci
 npm run build
