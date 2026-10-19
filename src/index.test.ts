@@ -21,30 +21,20 @@ import { extractOAuthErrorDetail } from "./oauth.js";
 import {
   deriveModelDisplayName,
   getClaudeToolsForActiveOpenCodeTools,
+  normalizeThinkingForSonnet55,
   rewriteSystemBlocksForModel,
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
   stripSystemCacheControl,
+  supportsAdaptiveThinking,
 } from "./index.js";
 import { createSseProcessor, parseSseEvent, buildSseEvent } from "./stream.js";
-
-// ── Helpers (extracted / reimplemented from index.ts for unit testing) ────────
-
-const THINKING_MODELS = [
-  "claude-opus-4",
-  "claude-sonnet-4-6",
-];
-
-function shouldInjectThinking(model: string | undefined): boolean {
-  if (!model) return false;
-  return THINKING_MODELS.some((m) => model.includes(m));
-}
 
 // Simulate the body-transform logic from the fetch wrapper
 function transformBody(bodyStr: string): Record<string, unknown> {
   const parsed = JSON.parse(bodyStr);
 
-  const supportsThinking = shouldInjectThinking(parsed.model);
+  const supportsThinking = supportsAdaptiveThinking(parsed.model);
   if (!parsed.thinking && supportsThinking) {
     parsed.thinking = { type: "adaptive" };
   }
@@ -94,11 +84,59 @@ describe("thinking injection", () => {
     assert.deepEqual(out.thinking, { type: "adaptive" });
   });
 
+  for (const model of ["claude-opus-5-5", "claude-sonnet-5", "claude-sonnet-5-5", "claude-fable-5-1"]) {
+    it(`injects adaptive thinking for ${model}`, () => {
+      const out = transformBody(JSON.stringify({ model, messages: [] }));
+      assert.deepEqual(out.thinking, { type: "adaptive" });
+    });
+  }
+
   it("does not overwrite an existing thinking block", () => {
     const out = transformBody(
       JSON.stringify({ model: "claude-sonnet-4-6", messages: [], thinking: { type: "disabled" } }),
     );
     assert.deepEqual(out.thinking, { type: "disabled" });
+  });
+});
+
+describe("Sonnet 5.5 thinking normalization", () => {
+  const run = (body: Record<string, unknown>) => {
+    normalizeThinkingForSonnet55(body);
+    return body;
+  };
+
+  it("rewrites thinking:disabled to between_tools", () => {
+    const out = run({ model: "claude-sonnet-5-5", thinking: { type: "disabled" }, output_config: { effort: "medium" } });
+    assert.deepEqual(out.thinking, { type: "between_tools" });
+    assert.deepEqual(out.output_config, { effort: "medium" });
+  });
+
+  it("clamps xhigh and max effort to high when between_tools is in effect", () => {
+    for (const effort of ["xhigh", "max"]) {
+      const out = run({ model: "claude-sonnet-5-5", thinking: { type: "disabled" }, output_config: { effort } });
+      assert.deepEqual(out.output_config, { effort: "high" });
+    }
+  });
+
+  it("strips extra fields sent alongside between_tools", () => {
+    const out = run({ model: "claude-sonnet-5-5", thinking: { type: "between_tools", display: "summarized" } });
+    assert.deepEqual(out.thinking, { type: "between_tools" });
+  });
+
+  it("leaves adaptive thinking and its effort untouched", () => {
+    const out = run({ model: "claude-sonnet-5-5", thinking: { type: "adaptive" }, output_config: { effort: "max" } });
+    assert.deepEqual(out.thinking, { type: "adaptive" });
+    assert.deepEqual(out.output_config, { effort: "max" });
+  });
+
+  it("does not touch other models (Sonnet 5 still accepts disabled)", () => {
+    const out = run({ model: "claude-sonnet-5", thinking: { type: "disabled" } });
+    assert.deepEqual(out.thinking, { type: "disabled" });
+  });
+
+  it("tolerates a missing thinking block", () => {
+    const out = run({ model: "claude-sonnet-5-5" });
+    assert.equal(out.thinking, undefined);
   });
 });
 
@@ -1134,6 +1172,16 @@ describe("deriveModelDisplayName", () => {
 
   it("ignores a trailing date suffix (claude-haiku-4-5-20251001 → Haiku 4.5)", () => {
     assert.equal(deriveModelDisplayName("claude-haiku-4-5-20251001"), "Haiku 4.5");
+  });
+
+  it("renders major-only ids (claude-sonnet-5 → Sonnet 5)", () => {
+    assert.equal(deriveModelDisplayName("claude-sonnet-5"), "Sonnet 5");
+    assert.equal(deriveModelDisplayName("claude-opus-5-5"), "Opus 5.5");
+    assert.equal(deriveModelDisplayName("claude-fable-5-1"), "Fable 5.1");
+  });
+
+  it("does not read a date as a minor version (claude-sonnet-5-20260101 → Sonnet 5)", () => {
+    assert.equal(deriveModelDisplayName("claude-sonnet-5-20260101"), "Sonnet 5");
   });
 
   it("falls back to the raw id when the convention doesn't match", () => {

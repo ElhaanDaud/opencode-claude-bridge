@@ -116,20 +116,50 @@ const INBOUND_TOOL_NAME_MAP: Record<string, string> = {
   ExitPlanMode: "plan_exit",
 };
 
+// Fallback catalog, used only for ids the host's own model list lacks.
+// Prices per million tokens, from platform.claude.com/docs/en/about-claude/pricing.
 const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
+  "claude-fable-5-1": {
+    name: "Claude Fable 5.1",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 10, output: 50, cache_read: 0.25, cache_write: 12.5 },
+  },
+  "claude-opus-5-5": {
+    name: "Claude Opus 5.5",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 4, output: 20, cache_read: 0.2, cache_write: 5 },
+  },
+  "claude-sonnet-5-5": {
+    name: "Claude Sonnet 5.5",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 2, output: 10, cache_read: 0.2, cache_write: 2.5 },
+  },
+  "claude-sonnet-5": {
+    name: "Claude Sonnet 5",
+    attachment: true, reasoning: true, tool_call: true, temperature: false,
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ["text", "image"], output: ["text"] },
+    cost: { input: 2, output: 10, cache_read: 0.2, cache_write: 2.5 },
+  },
   "claude-opus-4-6": {
     name: "Claude Opus 4.6",
     attachment: true, reasoning: true, tool_call: true, temperature: false,
     limit: { context: 200000, output: 32000 },
     modalities: { input: ["text", "image"], output: ["text"] },
-    cost: { input: 15, output: 75, cache_read: 1.5, cache_write: 18.75 },
+    cost: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   },
   "claude-opus-4-5": {
     name: "Claude Opus 4.5",
     attachment: true, reasoning: true, tool_call: true, temperature: false,
     limit: { context: 200000, output: 32000 },
     modalities: { input: ["text", "image"], output: ["text"] },
-    cost: { input: 15, output: 75, cache_read: 1.5, cache_write: 18.75 },
+    cost: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   },
   "claude-sonnet-4-6": {
     name: "Claude Sonnet 4.6",
@@ -148,9 +178,9 @@ const ANTHROPIC_MODELS: Record<string, ProviderModel> = {
   "claude-haiku-4-5-20251001": {
     name: "Claude Haiku 4.5",
     attachment: true, reasoning: false, tool_call: true, temperature: true,
-    limit: { context: 200000, output: 8192 },
+    limit: { context: 200000, output: 64000 },
     modalities: { input: ["text", "image"], output: ["text"] },
-    cost: { input: 0.8, output: 4, cache_read: 0.08, cache_write: 1 },
+    cost: { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 },
   },
 };
 
@@ -171,21 +201,22 @@ const CLAUDE_PREFIX =
 /**
  * Derive a human-readable display name from a Claude model ID.
  *
- * Matches `claude-{family}-{major}-{minor}[-{date}]` (the convention used
+ * Matches `claude-{family}-{major}[-{minor}][-{date}]` (the convention used
  * for every Claude model family to date) and renders e.g.
  *   claude-opus-4-7            -> "Opus 4.7"
  *   claude-haiku-4-5-20251001  -> "Haiku 4.5"
- *   claude-sonnet-4-6          -> "Sonnet 4.6"
+ *   claude-sonnet-5            -> "Sonnet 5"
  *
  * Falls back to the raw model ID if the convention doesn't match, so future
  * naming changes are surfaced truthfully instead of silently wrong.
  */
 export function deriveModelDisplayName(modelId: string): string {
-  const m = modelId.match(/^claude-([a-z]+)-(\d+)-(\d+)(?:-\d+)?$/i);
+  // Minor is 1-2 digits so a dated major-only id (claude-sonnet-5-20260101) isn't read as "5.20260101".
+  const m = modelId.match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/i);
   if (!m) return modelId;
   const [, family, major, minor] = m;
   const capitalized = family.charAt(0).toUpperCase() + family.slice(1).toLowerCase();
-  return `${capitalized} ${major}.${minor}`;
+  return minor === undefined ? `${capitalized} ${major}` : `${capitalized} ${major}.${minor}`;
 }
 
 /**
@@ -212,6 +243,39 @@ export function rewriteSystemBlocksForModel(
 
     return { ...block, text };
   });
+}
+
+// Explicit allowlist: haiku and older sonnet variants (e.g. claude-sonnet-4-5)
+// reject the field entirely. Opus 4.x and Sonnet 4.6 are confirmed; Fable 5.x,
+// Opus 5.x and Sonnet 5 are documented as adaptive-thinking models.
+const ADAPTIVE_THINKING_MODELS = [
+  "claude-opus-4",
+  "claude-sonnet-4-6",
+  "claude-opus-5",
+  "claude-sonnet-5",
+  "claude-fable-5",
+];
+
+export function supportsAdaptiveThinking(model: unknown): boolean {
+  return typeof model === "string" && ADAPTIVE_THINKING_MODELS.some((m) => model.includes(m));
+}
+
+const EFFORTS_ABOVE_HIGH = new Set(["xhigh", "max"]);
+
+// Sonnet 5.5 rejects thinking:{type:"disabled"} with a 400; "between_tools" is its lowest
+// thinking setting, accepts no other thinking field, and 400s at xhigh/max effort.
+export function normalizeThinkingForSonnet55(parsed: {
+  model?: unknown;
+  thinking?: { type?: string; [key: string]: unknown };
+  output_config?: { effort?: string; [key: string]: unknown };
+}): void {
+  if (typeof parsed.model !== "string" || !parsed.model.startsWith("claude-sonnet-5-5")) return;
+  if (parsed.thinking?.type === "disabled") parsed.thinking = { type: "between_tools" };
+  if (parsed.thinking?.type !== "between_tools") return;
+  parsed.thinking = { type: "between_tools" };
+  if (parsed.output_config?.effort && EFFORTS_ABOVE_HIGH.has(parsed.output_config.effort)) {
+    parsed.output_config.effort = "high";
+  }
 }
 
 export function stripSystemCacheControl(
@@ -772,17 +836,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   );
                 } catch {}
 
-                // Only inject adaptive thinking for models that support it.
-                // Use an explicit allowlist — haiku and older sonnet variants
-                // (e.g. claude-sonnet-4-5) reject the field entirely.
-                // claude-sonnet-4-6 and claude-opus-4-x are confirmed to support
-                // interleaved-thinking-2025-05-14.
-                const THINKING_MODELS = [
-                  "claude-opus-4",
-                  "claude-sonnet-4-6",
-                ];
-                const supportsThinking = parsed.model &&
-                  THINKING_MODELS.some((m: string) => parsed.model.includes(m));
+                const supportsThinking = supportsAdaptiveThinking(parsed.model);
                 if (!parsed.thinking && supportsThinking) {
                   parsed.thinking = { type: "adaptive" };
                 }
@@ -814,6 +868,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                     parsed.output_config = { effort: DEFAULT_EFFORT };
                   }
                 }
+                normalizeThinkingForSonnet55(parsed);
 
                 const profile = auth.access
                   ? await fetchOAuthProfile(auth.access)
