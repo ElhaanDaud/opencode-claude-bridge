@@ -72,9 +72,10 @@ export type StreamProcessorDeps = {
   translateToolArgs: (json: string, toolName: string) => string;
 
   /**
-   * Optional debug sink for swallowed errors. Called with a short
-   * message describing what was swallowed and why. Typically wired to
-   * a console.error behind an env flag.
+   * Optional sink for swallowed errors. Called with a short message
+   * describing what was swallowed and why. Messages never include stream
+   * content, since model output can carry file contents or secrets and the
+   * sink is wired to the server log.
    */
   debug?: (msg: string) => void;
 };
@@ -121,8 +122,9 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     let obj: unknown;
     try {
       obj = JSON.parse(data);
-    } catch (e) {
-      deps.debug?.(`processEvent: JSON.parse failed: ${e instanceof Error ? e.message : String(e)}`);
+    } catch {
+      // V8's parse error quotes the input, so report only the frame's shape.
+      deps.debug?.(`processEvent: JSON.parse failed for a ${data.length}-byte ${event ?? "data"} frame; passed through unchanged`);
       return block;
     }
 

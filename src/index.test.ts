@@ -1024,12 +1024,13 @@ describe("SSE processor: error handling", () => {
       translateToolArgs: translateToolArgsJsonString,
       debug: (m) => messages.push(m),
     });
-    const malformed = "event: content_block_start\ndata: {not valid\n\n";
+    const malformed = "event: content_block_start\ndata: {not valid sk-ant-secret\n\n";
     const out = proc.feedChunk(malformed);
     // Passed through as-is
     assert.equal(out, malformed);
-    // And we told the operator about it (behind their debug flag)
+    // And we told the operator about it, without copying stream content into the log
     assert.ok(messages.some((m) => m.includes("JSON.parse failed")), `Expected debug log, got: ${JSON.stringify(messages)}`);
+    assert.ok(messages.every((m) => !m.includes("sk-ant-secret") && !m.includes("not valid")), `Leaked payload: ${JSON.stringify(messages)}`);
   });
 
   it("calls debug callback when translateToolArgs throws", () => {

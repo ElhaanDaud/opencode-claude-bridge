@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { join } from "node:path";
 import {
@@ -497,6 +497,21 @@ function mergeHeaders(target: Headers, source: HeadersInit) {
   }
 }
 
+function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /** Build deduplicated beta flags string. */
 function buildBetaFlags(existing: string): string {
   // Dropping caller flags makes the API reject newer body fields they gate.
@@ -593,6 +608,22 @@ function readCachedClaudePromptCache(): ClaudeSystemPromptCache | null {
   }
 }
 
+let promptCacheMtime = -1;
+let promptCache: ClaudeSystemPromptCache | null = null;
+
+// Re-read when the file changes, so a fresh capture applies without a restart.
+function currentPromptCache(): ClaudeSystemPromptCache | null {
+  let mtime = 0;
+  try {
+    mtime = statSync(SYSTEM_PROMPT_CACHE_PATH).mtimeMs;
+  } catch {}
+  if (mtime !== promptCacheMtime) {
+    promptCacheMtime = mtime;
+    promptCache = mtime ? readCachedClaudePromptCache() : null;
+  }
+  return promptCache;
+}
+
 function getStableDeviceId(): string {
   let who = "unknown";
   try {
@@ -659,8 +690,6 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   const savedApiKey = process.env.ANTHROPIC_API_KEY;
   const sessionId = SESSION_ID || randomUUID();
   const deviceId = getStableDeviceId();
-  const cachedClaudePromptCache = readCachedClaudePromptCache();
-  const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
 
   // Multi-account pool. Inactive until the user enrolls an account, in which
   // case every path below falls back to the original single-account behaviour.
@@ -799,7 +828,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               }
               activeLabel = acquired.label;
               accessToken = acquired.accessToken;
-            } else if (!accessToken || !auth.expires || auth.expires < Date.now()) {
+            } else if (!accessToken || !auth.expires || auth.expires < Date.now() + 60_000) {
               try {
                 accessToken = await refreshAuth(auth, client);
               } catch (err) {
@@ -875,6 +904,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   parsed.temperature = 1;
                 }
 
+                if (typeof parsed.system === "string") {
+                  parsed.system = [{ type: "text", text: parsed.system }];
+                }
                 if (!parsed.system) parsed.system = [];
                 if (Array.isArray(parsed.messages)) {
                   parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
@@ -916,6 +948,8 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   (s: { text?: string }) =>
                     s.text?.startsWith("x-anthropic-billing-header:"),
                 );
+                const cachedClaudePromptCache = currentPromptCache();
+                const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
                 let billingHeader = buildBillingHeader(sessionId, cachedClaudePromptCache, dynamicFingerprint);
                 if (!hasBilling) {
                   parsed.system.unshift({
@@ -984,8 +1018,11 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 body = JSON.stringify(parsed);
-              } catch {
+              } catch (err) {
                 ownsUserId = false;
+                console.error(
+                  `[opencode-claude-bridge] request rewrite failed; sending the body unmodified: ${err instanceof Error ? err.message : String(err)}`,
+                );
               }
             }
 
@@ -1069,7 +1106,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   console.error(
                     `[claude-pool] ${activeLabel}: ${decision.reason}; retrying in ${decision.backoffMs ?? 1000}ms`,
                   );
-                  await new Promise((r) => setTimeout(r, decision.backoffMs ?? 1000));
+                  await abortableSleep(decision.backoffMs ?? 1000, init?.signal);
                   response = await doFetch();
                   if (response.ok) break;
                   continue;
@@ -1116,6 +1153,24 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               await pool.markSuccess(activeLabel);
             }
 
+            if (!poolActive && response.status === 401) {
+              console.error("[opencode-claude-bridge] 401 from Anthropic; refreshing token and retrying once");
+              let freshToken: string | null = null;
+              try {
+                freshToken = await refreshAuth(auth, client);
+              } catch (err) {
+                const detail = err instanceof Error ? err.message : String(err);
+                console.error(`[opencode-claude-bridge] OAuth refresh failed after 401: ${detail}`);
+                await response.body?.cancel();
+                return buildAuthFailureResponse(detail);
+              }
+              if (freshToken && freshToken !== accessToken) {
+                await response.body?.cancel();
+                outHeaders["authorization"] = `Bearer ${freshToken}`;
+                response = await doFetch();
+              }
+            }
+
             // Legacy single-account path: refresh the token and retry, on the
             // assumption that rate limits are per-access-token.
             if (!poolActive && response.status === 429) {
@@ -1135,7 +1190,8 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
                 outHeaders["authorization"] = `Bearer ${freshToken}`;
                 // Back off briefly: 1s first retry, 2s second
-                await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+                await abortableSleep(1000 * (retry + 1), init?.signal);
+                await response.body?.cancel();
                 response = await doFetch();
                 if (response.status !== 429) break;
               }
@@ -1157,6 +1213,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const processor = createSseProcessor({
               inboundToolNameMap: INBOUND_TOOL_NAME_MAP,
               translateToolArgs: translateToolArgsJsonString,
+              debug: (msg) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
             });
 
             return new Response(
@@ -1184,6 +1241,9 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                       controller.error(e);
                     }
                   })();
+                },
+                cancel(reason) {
+                  return reader.cancel(reason);
                 },
               }),
               { status: response.status, statusText: response.statusText, headers: response.headers },
