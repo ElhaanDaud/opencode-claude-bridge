@@ -1,6 +1,7 @@
 import { randomBytes, createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execFile } from "node:child_process";
+import { RETRYABLE_STATUSES, getTokenRetryDelayMs } from "./retry.js";
 import {
   CLIENT_ID,
   TOKEN_URL,
@@ -96,7 +97,8 @@ async function curlPost(
 ): Promise<{ status: number; body: string }> {
   const payload = JSON.stringify(body);
 
-  for (let attempt = 0; attempt < retries; attempt++) {
+  for (let attempt = 0; ; attempt++) {
+    let retryDelayMs: number;
     try {
       const result = await runCurl(payload);
 
@@ -104,25 +106,25 @@ async function curlPost(
       const status = parseInt(parts[parts.length - 1], 10);
       const responseBody = parts.slice(0, -1).join("\n__HTTP_STATUS__");
 
-      if (status !== 429 || attempt === retries - 1) {
+      if (!RETRYABLE_STATUSES.has(status) || attempt === retries - 1) {
         return { status, body: responseBody };
       }
+      const delayMs = getTokenRetryDelayMs(status, responseBody, attempt);
+      // Too long to wait inside a request: report the endpoint's real answer.
+      if (delayMs === null) return { status, body: responseBody };
+      retryDelayMs = delayMs;
 
       console.error(
-        `[opencode-oauth] Token endpoint 429 (attempt ${attempt + 1}/${retries}), retrying...`,
+        `[opencode-oauth] Token endpoint ${status} (attempt ${attempt + 1}/${retries}), retrying...`,
       );
     } catch (err) {
       if (attempt === retries - 1) {
         throw new Error(`Token endpoint unreachable: ${describeCurlFailure(err)}`);
       }
+      retryDelayMs = 1000 * Math.pow(2, attempt) + Math.random() * 1000;
     }
-    await sleep(1000 * Math.pow(2, attempt) + Math.random() * 1000);
+    await sleep(retryDelayMs);
   }
-
-  return {
-    status: 429,
-    body: '{"error":{"type":"rate_limit_error","message":"Rate limited"}}',
-  };
 }
 
 /** The OAuth server's error text, or null for a non-JSON (proxy/firewall) body, which is never quoted. */
