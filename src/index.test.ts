@@ -31,6 +31,8 @@ import {
   rewriteSystemBlocksForModel,
   shouldInjectClaudeTools,
   stripAssistantPrefillForClaude,
+  stripMessageCacheControlPreservingTail,
+  mergeClaudeSystemPrompt,
   stripSystemCacheControl,
   supportsAdaptiveThinking,
 } from "./index.js";
@@ -261,12 +263,90 @@ describe("Claude assistant prefill stripping", () => {
     ]);
   });
 
-  it("keeps non-synthetic assistant messages intact", () => {
+  it("keeps a real assistant tail and follows it with a user turn", () => {
     const input = [
       { role: "user", content: [{ type: "text", text: "hello" }] },
       { role: "assistant", content: "Real assistant content" },
     ];
-    assert.deepEqual(stripAssistantPrefillForClaude(input), input);
+    assert.deepEqual(stripAssistantPrefillForClaude(input), [
+      ...input,
+      { role: "user", content: "Continue." },
+    ]);
+  });
+
+  it("ends on a user turn after opencode's max-steps prefill, in string or block form", () => {
+    const maxSteps = "CRITICAL - MAXIMUM STEPS REACHED\n\nTools are disabled until next user input.";
+    for (const content of [maxSteps, [{ type: "text", text: maxSteps }]]) {
+      const out = stripAssistantPrefillForClaude([
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content },
+      ]);
+      assert.equal(out.at(-1)?.role, "user");
+      assert.deepEqual(out[1], { role: "assistant", content });
+    }
+  });
+
+  it("drops the nudge, then appends a user turn if an assistant turn is left at the tail", () => {
+    const out = stripAssistantPrefillForClaude([
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "answer" },
+      { role: "assistant", content: "Continue with your tasks." },
+    ]);
+    assert.deepEqual(out, [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "answer" },
+      { role: "user", content: "Continue." },
+    ]);
+  });
+
+  it("leaves a user-tailed conversation unchanged", () => {
+    const input = [
+      { role: "assistant", content: "earlier" },
+      { role: "user", content: "hello" },
+    ];
+    assert.equal(stripAssistantPrefillForClaude(input), input);
+  });
+});
+
+describe("message cache_control", () => {
+  it("keeps the tail message's text breakpoint and strips earlier ones", () => {
+    const marker = { type: "ephemeral" };
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "old", cache_control: marker }] },
+      { role: "assistant", content: [{ type: "text", text: "mid", cache_control: marker }] },
+      { role: "user", content: [{ type: "text", text: "tail", cache_control: marker }] },
+    ];
+    stripMessageCacheControlPreservingTail(messages);
+    assert.equal("cache_control" in messages[0]!.content[0]!, false);
+    assert.equal("cache_control" in messages[1]!.content[0]!, false);
+    assert.deepEqual(messages[2]!.content[0]!.cache_control, marker);
+  });
+
+  it("leaves non-text blocks alone", () => {
+    const marker = { type: "ephemeral" };
+    const result = { type: "tool_result", tool_use_id: "t", content: "r", cache_control: marker };
+    stripMessageCacheControlPreservingTail([{ content: [result] }, { content: "tail" }]);
+    assert.deepEqual(result.cache_control, marker);
+  });
+});
+
+describe("system prompt merge", () => {
+  it("puts Claude Code's prompt first and keeps OpenCode's blocks after it", () => {
+    const out = mergeClaudeSystemPrompt(
+      "x-anthropic-billing-header: cc_version=1",
+      [{ type: "text", text: "CLAUDE" }],
+      [
+        { type: "text", text: "x-anthropic-billing-header: cc_version=1" },
+        { type: "text", text: "agent prompt" },
+        { type: "text", text: "AGENTS.md rules" },
+      ],
+    );
+    assert.deepEqual(out.map((block) => block.text), [
+      "x-anthropic-billing-header: cc_version=1",
+      "CLAUDE",
+      "agent prompt",
+      "AGENTS.md rules",
+    ]);
   });
 });
 

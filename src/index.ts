@@ -37,6 +37,7 @@ import {
 } from "./claude-tools.js";
 import type { ToolDefinition } from "./claude-tools.js";
 import { translateSseStream } from "./stream.js";
+import { MAX_RESPONSE_RETRIES, RETRYABLE_STATUSES, getResponseRetryDelayMs } from "./retry.js";
 import { buildPoolBusyResponse, buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
 import { LockTimeoutError } from "./pool/rotation-state.js";
 import { truncate } from "./pool/dashboard.js";
@@ -657,15 +658,66 @@ function maybeUnquoteText(text: string): string {
   return text;
 }
 
+const OPENCODE_CONTINUATION_NUDGE = "Continue with your tasks.";
+const ASSISTANT_TAIL_CONTINUATION = "Continue.";
+
+/**
+ * The subscription endpoint rejects assistant prefill ("The conversation must
+ * end with a user message"). OpenCode's content-free nudge is dropped; any
+ * other assistant tail (max-steps notice, a resumed session) is kept and
+ * followed by a minimal user turn.
+ */
 export function stripAssistantPrefillForClaude(
   messages: Array<{ role?: string; content?: unknown }>,
 ): Array<{ role?: string; content?: unknown }> {
-  if (messages.length === 0) return messages;
-  const last = messages[messages.length - 1];
-  if (last?.role !== "assistant") return messages;
-  if (typeof last.content !== "string") return messages;
-  if (last.content.trim() !== "Continue with your tasks.") return messages;
-  return messages.slice(0, -1);
+  let result = messages;
+  const last = result[result.length - 1];
+  if (
+    last?.role === "assistant" &&
+    typeof last.content === "string" &&
+    last.content.trim() === OPENCODE_CONTINUATION_NUDGE
+  ) {
+    result = result.slice(0, -1);
+  }
+  if (result[result.length - 1]?.role === "assistant") {
+    result = [...result, { role: "user", content: ASSISTANT_TAIL_CONTINUATION }];
+  }
+  return result;
+}
+
+/**
+ * OpenCode's prompt-prefix cache breakpoint sits on the tail message. Earlier
+ * text breakpoints are stripped (the bridge relies on implicit prefix caching),
+ * but removing the tail one too left text-tailed turns never reading the cache.
+ * Run before stripAssistantPrefillForClaude so an appended turn doesn't
+ * become the "tail" and cost the real tail its marker.
+ */
+export function stripMessageCacheControlPreservingTail(
+  messages: Array<{ content?: unknown }>,
+): void {
+  for (let index = 0; index < messages.length - 1; index++) {
+    const content = messages[index]?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block && block.type === "text" && "cache_control" in block) delete block.cache_control;
+    }
+  }
+}
+
+/**
+ * Claude Code's captured system prompt leads (billing header first), and
+ * OpenCode's own system blocks — agent prompt, AGENTS.md, instructions — follow
+ * instead of being discarded.
+ */
+export function mergeClaudeSystemPrompt(
+  billingHeader: string,
+  claudeBlocks: Array<{ type?: string; text?: string }>,
+  opencodeBlocks: Array<{ type?: string; text?: string }>,
+): Array<{ type?: string; text?: string }> {
+  const own = opencodeBlocks.filter(
+    (block) => !block.text?.startsWith("x-anthropic-billing-header:"),
+  );
+  return [{ type: "text", text: billingHeader }, ...claudeBlocks, ...own];
 }
 
 function normalizeSystemBlocks(
@@ -1072,6 +1124,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
                 if (!parsed.system) parsed.system = [];
                 if (Array.isArray(parsed.messages)) {
+                  stripMessageCacheControlPreservingTail(parsed.messages);
                   parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
                 }
                 // context_management and output_config.effort are only
@@ -1124,16 +1177,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   billingHeader = parsed.system[0]?.text || billingHeader;
                 }
 
-                // If we have a locally captured Claude Code system prompt, prefer it.
+                // A locally captured Claude Code system prompt leads; OpenCode's
+                // own blocks (agent prompt, AGENTS.md) follow it.
                 if (cachedClaudeSystem) {
                   const rewritten = rewriteSystemBlocksForModel(
                     cachedClaudeSystem,
                     typeof parsed.model === "string" ? parsed.model : undefined,
                   );
-                  parsed.system = [
-                    { type: "text", text: billingHeader },
-                    ...rewritten,
-                  ];
+                  parsed.system = mergeClaudeSystemPrompt(billingHeader, rewritten, parsed.system);
                 } else if (parsed.system && Array.isArray(parsed.system)) {
                   // Otherwise keep the existing prompt but shape it closer to Claude Code.
                   parsed.system = normalizeSystemBlocks(parsed.system);
@@ -1160,7 +1211,6 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                     for (const block of msg.content) {
                       if (block.type === "text" && typeof block.text === "string") {
                         block.text = maybeUnquoteText(block.text);
-                        delete block.cache_control;
                       }
                       if (block.type === "tool_use" && block.name) {
                         block.name = mapOutboundToolName(block.name);
@@ -1398,17 +1448,28 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               }
             }
 
-            // Legacy single-account path: refresh the token and retry, on the
-            // assumption that rate limits are per-access-token.
-            if (!usePool && response.status === 429) {
-              for (let retry = 0; retry < 2; retry++) {
-                console.error(`[opencode-claude-bridge] 429 rate limited (attempt ${retry + 1}/2), refreshing token...`);
+            // Single-account path: retry 429 (rate limited) and 529 (overloaded)
+            // as long as Retry-After asks. A longer wait is handed back at once,
+            // so a 429 resetting in hours neither blocks the request nor spends
+            // a single-use refresh token for nothing.
+            for (
+              let retry = 0;
+              !usePool && retry < MAX_RESPONSE_RETRIES && RETRYABLE_STATUSES.has(response.status);
+              retry++
+            ) {
+              const delayMs = getResponseRetryDelayMs(response.headers, retry);
+              if (delayMs === null) break;
+              const attempt = `attempt ${retry + 1}/${MAX_RESPONSE_RETRIES}`;
+              if (response.status === 429) {
+                // Rate limits may be per access token, so a fresh one can help.
+                console.error(`[opencode-claude-bridge] 429 rate limited (${attempt}), refreshing token...`);
                 let freshToken: string | null = null;
                 try {
                   freshToken = await refreshAuth(auth, client);
                 } catch (err) {
                   const detail = err instanceof Error ? err.message : String(err);
                   console.error(`[opencode-claude-bridge] OAuth refresh failed after 429: ${detail}`);
+                  await response.body?.cancel();
                   return buildAuthFailureResponse(detail);
                 }
                 if (!freshToken) {
@@ -1416,12 +1477,12 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                   break;
                 }
                 outHeaders["authorization"] = `Bearer ${freshToken}`;
-                // Back off briefly: 1s first retry, 2s second
-                await abortableSleep(1000 * (retry + 1), init?.signal);
-                await response.body?.cancel();
-                response = await doFetch();
-                if (response.status !== 429) break;
+              } else {
+                console.error(`[opencode-claude-bridge] ${response.status} overloaded (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s`);
               }
+              await response.body?.cancel();
+              await abortableSleep(delayMs, init?.signal);
+              response = await doFetch();
             }
 
             // ── Map Claude-style tool names and arguments back to OpenCode ──
