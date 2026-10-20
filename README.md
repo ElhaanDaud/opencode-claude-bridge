@@ -242,7 +242,7 @@ claude-pool enroll    # label is derived from the account's email
 claude login          # as the second account
 claude-pool enroll
 
-claude-pool list      # confirm both are present
+claude-pool dashboard # confirm both are present
 ```
 
 Pass a label explicitly to override the derived one: `claude-pool enroll work`.
@@ -269,7 +269,6 @@ pooled account refreshes its entry instead of duplicating it. Set
 | `claude-pool auto` | Enroll the logged-in account only if the pool has not seen it |
 | `claude-pool install-hook` | Print a shell function that runs `auto` after `claude login` |
 | `claude-pool whoami` | Show which account Claude CLI is logged into, and whether it is pooled |
-| `claude-pool list` | Every enrolled account with its status and token expiry |
 | `claude-pool status` | Active account and what rotation would pick next |
 | `claude-pool dashboard` | Interactive manager (prints the status when not in a terminal) |
 | `claude-pool enable <label>` | Re-enable one account (clears its cooldown or disabled flag) |
@@ -350,7 +349,7 @@ account in turn.
 
 The practical consequence: **after the pool refreshes an account, the Claude
 CLI's own stored copy of that credential is stale.** That is expected. Run
-`claude-pool list` rather than trusting the CLI's view.
+`claude-pool dashboard` rather than trusting the CLI's view.
 
 ## Requirements
 

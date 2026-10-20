@@ -141,7 +141,7 @@ claude-pool enroll    # label derived from its email
 claude login          # account #2 — safe, #1 is already captured
 claude-pool enroll
 
-claude-pool list      # both should appear
+claude-pool dashboard # both should appear
 ```
 
 Repeat for as many accounts as you like. To choose the label yourself:
@@ -185,11 +185,10 @@ Set `CLAUDE_POOL_AUTO_ENROLL=0` to disable the startup check.
 ### Expected output
 
 ```
-LABEL     EMAIL                      TIER   STATUS   TOKEN EXPIRES
- alice    alice@example.com          max    ready    2026-08-20T02:23:10.552Z
-*bob      bob@example.com            max    ready    2026-08-20T03:54:35.726Z
+Claude pool — 2 enrolled · 2 ready · 0 cooling · 0 disabled
 
-* = active account (mirrored into opencode's anthropic slot)
+  ● alice    alice@example.com  ready
+▸ ● bob      bob@example.com    ready
 ```
 
 **(macOS)** The first Keychain write may prompt for your login password.
@@ -296,7 +295,7 @@ Never call the token endpoint by hand against a stored refresh token.
 ### `claude-pool whoami` says the credential is superseded
 
 Expected after a rotation. The pool refreshes tokens independently, which makes
-the Claude CLI's own copy stale. `claude-pool list` is authoritative.
+the Claude CLI's own copy stale. `claude-pool dashboard` is authoritative.
 
 ### Everything is cooling down
 
@@ -314,11 +313,11 @@ claude-pool clear-cooldowns
 ### Rotation never happens
 
 ```bash
-claude-pool list
+claude-pool dashboard
 ```
 
 With fewer than two usable accounts there is nowhere to rotate. Accounts marked
-`DISABLED` are excluded until re-enrolled, or until `claude-pool enable <label>`
+`needs re-login` are excluded until re-enrolled, or until `claude-pool enable <label>`
 if you know the credential is still good.
 
 ### Keychain prompts on every rotation (macOS)
@@ -353,7 +352,7 @@ not in the repo.
 
 ```bash
 # Remove enrolled accounts
-claude-pool list
+claude-pool dashboard            # shows the labels
 claude-pool remove <label>        # repeat per account
 
 # Remove rotation state

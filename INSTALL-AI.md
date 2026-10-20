@@ -146,11 +146,12 @@ claude-pool enroll
 claude login          # log in as account 2; account 1 is already saved
 claude-pool enroll
 
-claude-pool list      # every account should show as ready
+claude-pool dashboard # every account should show as ready
 ```
 
 Rotation needs at least two accounts. Wait for the user to confirm, then run
-`claude-pool list` yourself and check that no account shows `DISABLED`.
+`claude-pool dashboard` yourself (it prints a plain summary when not run in a
+terminal) and check that no account shows `needs re-login` or `disabled`.
 
 ## 7. Verify
 
