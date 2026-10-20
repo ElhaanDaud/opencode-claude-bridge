@@ -36,7 +36,7 @@ import {
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
 import type { ToolDefinition } from "./claude-tools.js";
-import { createSseProcessor } from "./stream.js";
+import { translateSseStream } from "./stream.js";
 import { buildPoolBusyResponse, buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
 import { LockTimeoutError } from "./pool/rotation-state.js";
 import { truncate } from "./pool/dashboard.js";
@@ -1427,51 +1427,14 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             // ── Map Claude-style tool names and arguments back to OpenCode ──
             if (!response.body) return response;
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            const encoder = new TextEncoder();
-
-            // Parse SSE events on \n\n boundaries, buffer tool_use
-            // input_json_delta fragments per content-block index, and
-            // translate the assembled JSON once at content_block_stop.
-            // This avoids chunk-boundary corruption (e.g. "file_" + "path"
-            // split across TCP chunks) that regex-on-raw-bytes can't
-            // handle. See src/stream.ts for the processor implementation.
-            const processor = createSseProcessor({
-              inboundToolNameMap,
-              translateToolArgs: translateToolArgsJsonString,
-              debug: (msg) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
-            });
-
+            // Tool_use arguments are buffered and translated whole at
+            // content_block_stop, since fragments split mid-key (e.g. "file_" +
+            // "path"). See src/stream.ts.
             return new Response(
-              new ReadableStream({
-                start(controller) {
-                  // Use start() with an async loop rather than pull():
-                  // Bun's ReadableStream doesn't reliably re-invoke pull()
-                  // when the handler resolves without enqueuing (which
-                  // happens while we're buffering input_json_delta
-                  // fragments), so pull() can stall the stream.
-                  (async () => {
-                    try {
-                      while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) {
-                          const tail = processor.flush();
-                          if (tail) controller.enqueue(encoder.encode(tail));
-                          controller.close();
-                          return;
-                        }
-                        const out = processor.feedChunk(decoder.decode(value, { stream: true }));
-                        if (out) controller.enqueue(encoder.encode(out));
-                      }
-                    } catch (e) {
-                      controller.error(e);
-                    }
-                  })();
-                },
-                cancel(reason) {
-                  return reader.cancel(reason);
-                },
+              translateSseStream(response.body, {
+                inboundToolNameMap,
+                translateToolArgs: translateToolArgsJsonString,
+                debug: (msg) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
               }),
               { status: response.status, statusText: response.statusText, headers: response.headers },
             );

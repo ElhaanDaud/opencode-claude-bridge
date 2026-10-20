@@ -229,5 +229,89 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
     return remaining;
   }
 
-  return { feedChunk, flush };
+  /** Drop buffered state after the consumer cancelled; nothing was abandoned. */
+  function discard(): void {
+    sseBuffer = "";
+    toolBlocks.clear();
+  }
+
+  return { feedChunk, flush, discard, pendingToolBlocks: () => toolBlocks.size };
+}
+
+/** OpenCode 1 aborts a stream after 300s without bytes by default (chunkTimeout). */
+export const DEFAULT_KEEPALIVE_MS = 15_000;
+
+/**
+ * SSE comment frame. Comments are ignored by SSE parsers but count as bytes
+ * for the host's read timeout.
+ */
+export const KEEPALIVE_FRAME = ": keepalive\n\n";
+
+/**
+ * Pipe an Anthropic SSE body through the processor. While a tool_use block is
+ * buffered nothing reaches the consumer, so a long Write can stay silent past
+ * the host's read timeout and be aborted; a comment frame is sent every
+ * `keepaliveMs` of downstream silence while input is buffered.
+ */
+export function translateSseStream(
+  body: ReadableStream<Uint8Array>,
+  deps: StreamProcessorDeps,
+  opts: { keepaliveMs?: number } = {},
+): ReadableStream<Uint8Array> {
+  const keepaliveMs = opts.keepaliveMs ?? DEFAULT_KEEPALIVE_MS;
+  const processor = createSseProcessor(deps);
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let cancelled = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      let lastEmit = Date.now();
+      const emit = (text: string) => {
+        if (!text || cancelled) return;
+        controller.enqueue(encoder.encode(text));
+        lastEmit = Date.now();
+      };
+      if (keepaliveMs > 0) {
+        timer = setInterval(() => {
+          if (processor.pendingToolBlocks() > 0 && Date.now() - lastEmit >= keepaliveMs) {
+            emit(KEEPALIVE_FRAME);
+          }
+        }, Math.max(1, Math.floor(keepaliveMs / 3)));
+      }
+
+      // Use start() with an async loop rather than pull(): Bun's ReadableStream
+      // doesn't reliably re-invoke pull() when the handler resolves without
+      // enqueuing (which happens while input_json_delta is buffered).
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (cancelled) {
+              processor.discard();
+              return;
+            }
+            if (done) {
+              emit(processor.feedChunk(decoder.decode()));
+              emit(processor.flush());
+              controller.close();
+              return;
+            }
+            emit(processor.feedChunk(decoder.decode(value, { stream: true })));
+          }
+        } catch (e) {
+          if (!cancelled) controller.error(e);
+        } finally {
+          clearInterval(timer);
+        }
+      })();
+    },
+    cancel(reason) {
+      cancelled = true;
+      clearInterval(timer);
+      return reader.cancel(reason);
+    },
+  });
 }
