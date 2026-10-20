@@ -10,7 +10,7 @@
  *   claude-pool enroll personal
  *   claude login                      # as the second account
  *   claude-pool enroll work
- *   claude-pool list
+ *   claude-pool dashboard
  */
 
 import { existsSync } from "node:fs";
@@ -24,7 +24,6 @@ const USAGE = [
   "  auto                        enroll the logged-in account if the pool has not seen it",
   "  install-hook                print a shell function that runs `auto` after `claude login`",
   "  whoami                      show which account Claude CLI is logged into",
-  "  list                        show every enrolled account and its status",
   "  status                      show active account and what rotation picks next",
   "  dashboard                   interactive manager (prints the status when not in a terminal)",
   "  enable <label>              re-enable one account (clears its cooldown or disabled flag)",
@@ -92,40 +91,6 @@ function when(ts) {
   return `${new Date(ts).toISOString()} (${mins > 0 ? `in ~${mins}m` : "now"})`;
 }
 
-async function list() {
-  await syncEnrolled();
-  const records = await accounts.listAccounts();
-  if (records.length === 0) {
-    console.log("No accounts enrolled. Run: claude-pool enroll <label>");
-    return;
-  }
-  const s = state.load();
-  const labelWidth = Math.max(9, ...records.map((r) => r.label.length)) + 2;
-  const emailWidth = Math.max(5, ...records.map((r) => (r.email ?? "?").length)) + 2;
-  console.log(
-    ` ${"LABEL".padEnd(labelWidth)}${"EMAIL".padEnd(emailWidth)}${"TIER".padEnd(10)}${"STATUS".padEnd(12)}TOKEN EXPIRES`,
-  );
-  for (const r of records.sort((a, b) => a.label.localeCompare(b.label))) {
-    const st = s.accounts[r.label];
-    const active = s.activeLabel === r.label ? "*" : " ";
-    const status = st?.disabled
-      ? "DISABLED"
-      : st?.cooldownUntil && st.cooldownUntil > Date.now()
-        ? "COOLING"
-        : "ready";
-    console.log(
-      `${active}${r.label.padEnd(labelWidth)}${(r.email ?? "?").padEnd(emailWidth)}${(r.subscriptionType ?? "?").padEnd(10)}${status.padEnd(12)}${new Date(r.oauth.expires).toISOString()}`,
-    );
-    if (st?.cooldownUntil && st.cooldownUntil > Date.now()) {
-      console.log(`${" ".repeat(labelWidth + 1)}cooling until ${when(st.cooldownUntil)} — ${st.lastReason ?? ""}`);
-    }
-    if (st?.disabled) {
-      console.log(`${" ".repeat(labelWidth + 1)}disabled — ${st.lastReason ?? ""}`);
-    }
-  }
-  console.log("\n* = active account (mirrored into opencode's anthropic slot)");
-  await warnIfSharingLogin();
-}
 
 async function enroll(label, flags = []) {
   const record = await enrollFromClaudeCli({
@@ -209,7 +174,7 @@ async function whoami() {
     // copy. A stale CLI credential therefore proves nothing about whether the
     // underlying account is enrolled, so do not claim that it is not.
     console.log("Claude CLI's stored credential is expired or superseded.");
-    console.log("It may already be in the pool under a newer token — check `claude-pool list`.");
+    console.log("It may already be in the pool under a newer token — check `claude-pool dashboard`.");
     console.log("To enroll this account fresh: run `claude login`, then `claude-pool enroll`.");
     return;
   }
@@ -330,7 +295,6 @@ async function dashboard() {
 try {
   switch (command) {
     case "enroll": await enroll(arg, flags); break;
-    case "list": await list(); break;
     case "status": await status(); break;
     case "dashboard": await dashboard(); break;
     case "whoami": await whoami(); break;
