@@ -1,4 +1,4 @@
-# opencode-claude-bridge
+# opencode-claude-pool
 
 Use your Claude Pro/Max subscription in [OpenCode](https://opencode.ai). If you're logged into the Claude CLI, it just works — no extra setup.
 
