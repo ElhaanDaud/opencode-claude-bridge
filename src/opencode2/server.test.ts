@@ -131,11 +131,13 @@ interface LoadOptions {
 async function load(opts: LoadOptions = {}) {
   const replies = opts.replies ?? {};
   const sent: Request[] = [];
+  const timeouts: unknown[] = [];
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     if (String(url).startsWith("data:")) return realFetch(url, init);
     if (!String(url).includes("/v1/messages")) return new Response("{}", { status: 404 });
     const request = new Request(url, init);
     sent.push(request);
+    timeouts.push(init && "timeout" in init ? init.timeout : undefined);
     const label = request.headers.get("authorization")?.replace("Bearer access-", "") ?? "none";
     const reply = replies[label] ?? { status: 401, body: "{}" };
     if (reply.reject) throw new TypeError("fetch failed");
@@ -181,7 +183,7 @@ async function load(opts: LoadOptions = {}) {
   cleanups.push(cleanup);
   const method = registered[0];
   assert.ok(method, "the OAuth method is registered");
-  return { hooks, sent, providers, method, cleanup };
+  return { hooks, sent, timeouts, providers, method, cleanup };
 }
 
 type Loaded = Awaited<ReturnType<typeof load>>;
@@ -238,7 +240,7 @@ async function through(loaded: Loaded, opts: ThroughOptions = {}) {
 async function send(opts: LoadOptions & ThroughOptions) {
   const loaded = await load(opts);
   const result = await through(loaded, opts);
-  return { ...result, sent: loaded.sent };
+  return { ...result, sent: loaded.sent, timeouts: loaded.timeouts };
 }
 
 function accountState(label: string) {
@@ -294,6 +296,15 @@ describe("OpenCode 2 entrypoint", () => {
     );
     assert.ok((accountState("alice")?.cooldownUntil ?? 0) > Date.now());
     assert.equal(createRotationStateStore({ path: defaultStatePath() }).load().activeLabel, "bob");
+  });
+
+  it("turns Bun's own fetch timeout off when it resends to the next account", async () => {
+    await enroll(["alice", "bob"]);
+    const { response, timeouts } = await send({ replies: { alice: RATE_LIMITED, bob: OK } });
+
+    assert.equal(response.status, 200);
+    // The first send is core's; the resend is the plugin's own.
+    assert.deepEqual(timeouts, [undefined, false]);
   });
 
   it("fails fast with the pool's 429 when every account is cooling", async () => {

@@ -72,9 +72,11 @@ const OK: Reply = { status: 200, body: "event: message_stop\ndata: {}\n\n" };
 
 async function send(replies: Reply[], body: unknown) {
   const sent: Array<Record<string, unknown>> = [];
+  const timeouts: unknown[] = [];
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     if (!String(url).includes("/v1/messages")) return new Response("{}", { status: 404 });
     sent.push(JSON.parse(String(init?.body)));
+    timeouts.push(init && "timeout" in init ? init.timeout : undefined);
     const reply = replies[Math.min(sent.length - 1, replies.length - 1)]!;
     return new Response(reply.body ?? "{}", { status: reply.status, headers: reply.headers });
   }) as typeof fetch;
@@ -89,7 +91,7 @@ async function send(replies: Reply[], body: unknown) {
     body: JSON.stringify(body),
   });
   await response.text();
-  return { status: response.status, sent };
+  return { status: response.status, sent, timeouts };
 }
 
 const plain = {
@@ -117,6 +119,12 @@ describe("single-account retry", () => {
     const { status, sent } = await send([{ status: 529, headers: { "retry-after": "0" } }], plain);
     assert.equal(status, 529);
     assert.equal(sent.length, 3);
+  });
+
+  it("turns Bun's own fetch timeout off for every send, retries included", async () => {
+    const { status, timeouts } = await send([{ status: 529, headers: { "retry-after": "0" } }, OK], plain);
+    assert.equal(status, 200);
+    assert.deepEqual(timeouts, [false, false]);
   });
 
   it("retries a 429 without spending the refresh token of a valid access token", async () => {

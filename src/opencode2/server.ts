@@ -17,7 +17,7 @@
 import { randomUUID } from "node:crypto";
 import { SESSION_ID } from "../constants.js";
 import { getClaudeTokens, readClaudeCredentials } from "../keychain.js";
-import { getStableDeviceId, prepareRequest, settlePoolResponse, startPool } from "../index.js";
+import { fetchUpstream, getStableDeviceId, prepareRequest, settlePoolResponse, startPool } from "../index.js";
 import type { PreparedRequest } from "../index.js";
 import {
   createAuthorizationRequest,
@@ -550,7 +550,7 @@ async function setup(ctx: V2Context): Promise<() => void> {
         outHeaders: prepared.outHeaders,
         body: prepared.body,
         ownsUserId: prepared.ownsUserId,
-        send: (headers, body) => globalThis.fetch(prepared.finalUrl, { method, headers, body, signal }),
+        send: (headers, body) => fetchUpstream(prepared.finalUrl, { method, headers, body, signal }),
         signal,
         sessionId,
         deviceId,

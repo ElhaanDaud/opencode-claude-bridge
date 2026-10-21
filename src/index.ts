@@ -661,6 +661,17 @@ function mergeHeaders(target: Headers, source: HeadersInit) {
   }
 }
 
+/**
+ * fetch for requests to Anthropic. Bun's fetch ends a response after 300 s
+ * without a byte, and OpenCode treats that error as final rather than retrying
+ * it. OpenCode turns it off (`timeout: false`) and applies its own idle
+ * timeouts through the abort signal, which callers pass on in `init`.
+ */
+export function fetchUpstream(url: string, init: RequestInit): Promise<Response> {
+  const bunInit: RequestInit & { timeout?: boolean } = { ...init, timeout: false };
+  return globalThis.fetch(url, bunInit);
+}
+
 function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason);
@@ -1668,7 +1679,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             let sentAt = 0;
             const doFetch = () => {
               sentAt = Date.now();
-              return globalThis.fetch(finalUrl, {
+              return fetchUpstream(finalUrl, {
                 method: init?.method || "POST",
                 body,
                 headers: outHeaders,
@@ -1682,7 +1693,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               response = await settlePoolResponse({
                 pool, toast, response, activeLabel, outHeaders, body,
                 ownsUserId: prepared.ownsUserId,
-                send: (headers, sendBody) => globalThis.fetch(finalUrl, {
+                send: (headers, sendBody) => fetchUpstream(finalUrl, {
                   method: init?.method || "POST", body: sendBody, headers, signal: init?.signal,
                 }),
                 signal: init?.signal, sessionId, deviceId, sentAt,

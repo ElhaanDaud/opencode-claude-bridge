@@ -83,7 +83,7 @@ const OK: Reply = { status: 200, body: "event: message_stop\ndata: {}\n\n" };
  * Replies are keyed by access token minus `access-`, so `alice-renewed` answers
  * alice's refreshed token.
  */
-async function sendWith(replies: Record<string, Reply>): Promise<{ status: number; tried: string[] }> {
+async function sendWith(replies: Record<string, Reply>): Promise<{ status: number; tried: string[]; timeouts: unknown[] }> {
   const accounts = createAccountStore(createSecretBackend());
   for (const label of ["alice", "bob"]) {
     await accounts.putAccount({
@@ -98,10 +98,12 @@ async function sendWith(replies: Record<string, Reply>): Promise<{ status: numbe
   await state.setActive("alice");
 
   const tried: string[] = [];
+  const timeouts: unknown[] = [];
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     if (!String(url).includes("/v1/messages")) return new Response("{}", { status: 404 });
     const token = String((init?.headers as Record<string, string>).authorization).replace("Bearer access-", "");
     tried.push(token);
+    timeouts.push(init && "timeout" in init ? init.timeout : undefined);
     const reply = replies[token]!;
     return new Response(reply.body, { status: reply.status, headers: reply.headers });
   }) as typeof fetch;
@@ -116,7 +118,7 @@ async function sendWith(replies: Record<string, Reply>): Promise<{ status: numbe
     body: JSON.stringify({ model: "claude-haiku-4-5-20251001", messages: [] }),
   });
   await response.text();
-  return { status: response.status, tried };
+  return { status: response.status, tried, timeouts };
 }
 
 function accountState(label: string) {
@@ -183,6 +185,16 @@ describe("pool rotation: 401/403 penalties need another account to succeed", () 
     assert.deepEqual(refreshCalls, ["refresh-alice"]);
     assert.equal(accountState("alice")?.disabled, false);
     assert.equal(accountState("bob")?.disabled, false);
+  });
+});
+
+describe("pool rotation: upstream requests", () => {
+  it("turns Bun's own fetch timeout off for the first send and the resend to the next account", async () => {
+    const { status, tried, timeouts } = await sendWith({ alice: RATE_LIMITED, bob: OK });
+
+    assert.equal(status, 200);
+    assert.deepEqual(tried, ["alice", "bob"]);
+    assert.deepEqual(timeouts, [false, false]);
   });
 });
 
