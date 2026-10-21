@@ -41,7 +41,7 @@ V2 prints `opencode v2.1.2`). Its major number picks the build:
 | Major | Branch | Plugin config key | Entry to register |
 | --- | --- | --- | --- |
 | `1` | `main` | `plugin` | the wrapper file from step 4a |
-| `2` | `feat/opencode-2` | `plugins` | the `dist/opencode2` directory |
+| `2` | `main` | `plugins` | the `dist/opencode2` directory |
 
 Anything else: tell the user the version is not supported and stop. Tell the
 user which version you detected and which branch you are installing.

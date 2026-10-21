@@ -15,8 +15,8 @@ Copy this one line into your AI coding agent (OpenCode, Claude Code, Cursor and 
 Follow the instructions at https://raw.githubusercontent.com/ElhaanDaud/opencode-claude-pool/main/INSTALL-AI.md to install opencode-claude-pool on this machine.
 ```
 
-The agent checks your OpenCode version and installs the matching build: `main`
-for OpenCode 1, `feat/opencode-2` for OpenCode 2. It edits your OpenCode config
+The agent checks your OpenCode version, builds `main` (one build serves both
+OpenCode 1 and 2) and registers the entry that version loads. It edits your OpenCode config
 in place after backing it up. Logging accounts in (`claude login`) stays with
 you, because each login is interactive. The full instructions it follows are in
 [INSTALL-AI.md](INSTALL-AI.md).
@@ -64,18 +64,18 @@ Then restart OpenCode. Full walkthrough, Linux notes and troubleshooting: [SETUP
 
 ### OpenCode 2 (manual)
 
-OpenCode 2 has a new plugin API and cannot load the V1 plugin. Its support
-lives on the `feat/opencode-2` branch for now. For `opencode --version` `2.x`:
+OpenCode 2 has a new plugin API and cannot load the V1 plugin, so it loads a
+separate entry, `dist/opencode2`, from the same build. For `opencode --version` `2.x`:
 
-**1. Clone the V2 branch and build**
+**1. Clone and build**
 
 ```bash
-git clone -b feat/opencode-2 https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
+git clone https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
 cd ~/src/opencode-claude-bridge && npm ci && npm run build
 ```
 
-If you already have a checkout of `main`, switch it instead:
-`git checkout feat/opencode-2 && git pull && npm ci && npm run build`.
+A checkout of the old `feat/opencode-2` branch can switch over:
+`git checkout main && git pull && npm ci && npm run build`.
 
 **2. Register the build directory** in `~/.config/opencode/opencode.json`. V2
 uses the `plugins` key (plural) and only loads a local plugin from a directory,
@@ -386,7 +386,7 @@ CLI's own stored copy of that credential is stale.** That is expected. Run
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1.2+, or v2 via the `feat/opencode-2` branch (tested on 2.1.2; see [OpenCode 2](#opencode-2-manual))
+- [OpenCode](https://opencode.ai) v1.2+, or v2 (tested on 2.1.0 and 2.1.2; see [OpenCode 2](#opencode-2-manual))
 - For OAuth: [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in (`claude login`)
 - macOS (Keychain) or Linux (`~/.claude/.credentials.json` fallback)
 - For API key: just configure a `provider` with `apiKey` in your OpenCode config as usual
