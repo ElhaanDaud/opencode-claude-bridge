@@ -7,7 +7,7 @@
  * fails at those splits. This module instead:
  *
  *   1. Frames on `\n\n` SSE event boundaries (chunks may contain partial
- *      or multiple events).
+ *      or multiple events), after normalising CRLF and CR line endings to LF.
  *   2. Buffers input_json_delta fragments per tool_use block (keyed by
  *      content-block index, so interleaved blocks don't corrupt each
  *      other).
@@ -96,6 +96,8 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
   type ToolBlockState = { toolName: string; partialJson: string };
   const toolBlocks = new Map<number, ToolBlockState>();
   let sseBuffer = "";
+  // The last chunk ended in "\r", so a leading "\n" completes that CRLF.
+  let afterCR = false;
 
   // Event types that require peeking into the JSON to decide whether/how to
   // mutate. Every other event type is a pure pass-through — no need to
@@ -199,7 +201,10 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
   }
 
   function feedChunk(text: string): string {
-    sseBuffer += text;
+    // SSE allows CRLF, LF or CR line endings; frame and parse on LF only.
+    const skip = afterCR && text.startsWith("\n") ? 1 : 0;
+    if (text) afterCR = text.endsWith("\r");
+    sseBuffer += text.slice(skip).replace(/\r\n?/g, "\n");
     let out = "";
     while (true) {
       const boundary = sseBuffer.indexOf("\n\n");
@@ -214,6 +219,7 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
   function flush(): string {
     const remaining = sseBuffer;
     sseBuffer = "";
+    afterCR = false;
     if (toolBlocks.size > 0) {
       // The upstream disconnected mid-tool_use without sending
       // content_block_stop, so we never emitted a synthetic translated
@@ -232,6 +238,7 @@ export function createSseProcessor(deps: StreamProcessorDeps) {
   /** Drop buffered state after the consumer cancelled; nothing was abandoned. */
   function discard(): void {
     sseBuffer = "";
+    afterCR = false;
     toolBlocks.clear();
   }
 

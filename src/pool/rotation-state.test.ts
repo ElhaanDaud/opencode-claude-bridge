@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,7 @@ import {
   defaultLockPath,
   defaultRotationState,
   defaultStatePath,
+  LockTimeoutError,
 } from "./rotation-state.js";
 import { ROTATION_STATE_VERSION } from "./types.js";
 import type { RotationState } from "./types.js";
@@ -38,6 +40,10 @@ function populatedState(): RotationState {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function reclaimClaims(lockPath: string): string[] {
+  return fs.readdirSync(path.dirname(lockPath)).filter((name) => name.includes(".reclaim-"));
 }
 
 describe("rotation state persistence", () => {
@@ -90,6 +96,47 @@ describe("rotation state persistence", () => {
     });
 
     assert.deepEqual(store.load(), defaultRotationState());
+  });
+
+  for (const [problem, contents] of [
+    ["malformed JSON", "{not-json"],
+    ["an unknown version", JSON.stringify({ ...populatedState(), version: 999 })],
+  ] as const) {
+    it(`moves a state file with ${problem} aside before the next write`, async (t) => {
+      const statePath = tempStatePath(t);
+      const store = createRotationStateStore({ path: statePath, clock: () => 7_000 });
+      await store.markDisabled("revoked", "refresh rejected");
+      fs.writeFileSync(statePath, contents, { mode: 0o600 });
+      const originalConsoleError = console.error;
+      console.error = () => undefined;
+      t.after(() => {
+        console.error = originalConsoleError;
+      });
+
+      await store.markSuccess("other", 7_000);
+
+      assert.equal(fs.readFileSync(`${statePath}.corrupt-7000`, "utf8"), contents);
+      assert.deepEqual(Object.keys(store.load().accounts), ["other"]);
+    });
+  }
+
+  it("refuses to write over a state file it cannot read", async (t) => {
+    const statePath = tempStatePath(t);
+    const store = createRotationStateStore({ path: statePath, lockPollMs: 1 });
+    await store.markDisabled("revoked", "refresh rejected");
+    await store.markCooldown("limited", 12_000, "usage window exhausted");
+    const before = fs.readFileSync(statePath, "utf8");
+
+    fs.chmodSync(statePath, 0o000);
+    try {
+      assert.throws(() => store.load(), { code: "EACCES" });
+      await assert.rejects(store.markSuccess("other", Date.now()), { code: "EACCES" });
+    } finally {
+      fs.chmodSync(statePath, 0o600);
+    }
+
+    assert.equal(fs.readFileSync(statePath, "utf8"), before);
+    assert.equal(store.load().accounts.revoked?.disabled, true);
   });
 
   it("preserves the original file and removes temp files after a failed save", (t) => {
@@ -210,23 +257,23 @@ describe("rotation state locking", () => {
     );
 
     // Simulate a rival waiter winning the reclaim between our read of the stale
-    // lock and our rename: it has already replaced it with its own lockfile,
-    // opened but not yet written. Its later write lands on that same inode.
-    const realRename = fs.renameSync;
-    let rivalFd: number | undefined;
-    t.mock.method(fs, "renameSync", (src: fs.PathLike, dest: fs.PathLike) => {
-      if (rivalFd === undefined && src === lockPath) {
+    // lock and our claim on it: it has already replaced it with its own
+    // lockfile, opened but not yet written. Its later write lands on that inode.
+    const realOpen = fs.openSync;
+    let rivalWritten: Promise<void> | undefined;
+    t.mock.method(fs, "openSync", (file: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode | null) => {
+      if (rivalWritten === undefined && String(file).startsWith(`${lockPath}.reclaim-`)) {
         fs.rmSync(lockPath);
-        rivalFd = fs.openSync(lockPath, "wx", 0o600);
-        setTimeout(() => {
+        const rivalFd = realOpen(lockPath, "wx", 0o600);
+        rivalWritten = delay(20).then(() => {
           fs.writeSync(
-            rivalFd!,
+            rivalFd,
             JSON.stringify({ pid: process.pid, hostname: os.hostname(), acquiredAt: 40_001, nonce: "rival" }),
           );
-          fs.closeSync(rivalFd!);
-        }, 20);
+          fs.closeSync(rivalFd);
+        });
       }
-      realRename(src, dest);
+      return realOpen(file, flags, mode);
     });
 
     const store = createRotationStateStore({
@@ -238,7 +285,116 @@ describe("rotation state locking", () => {
     });
 
     await assert.rejects(store.withLock(() => {}), /timed out/);
+    await rivalWritten;
     assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).nonce, "rival");
+    assert.deepEqual(reclaimClaims(lockPath), []);
+  });
+
+  it("times out on an unwritten lockfile instead of waiting for it to go stale", async (t) => {
+    const statePath = tempStatePath(t);
+    const lockPath = `${statePath}.lock`;
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    // What a holder that crashed between creating and writing its lock leaves.
+    fs.writeFileSync(lockPath, "", { mode: 0o600 });
+    const store = createRotationStateStore({
+      path: statePath,
+      staleLockMs: 1_000,
+      lockPollMs: 1,
+      lockTimeoutMs: 50,
+    });
+
+    const started = Date.now();
+    await assert.rejects(store.withLock(() => {}), LockTimeoutError);
+    assert.ok(Date.now() - started < 1_000, "waited for staleLockMs, not lockTimeoutMs");
+    assert.equal(fs.readFileSync(lockPath, "utf8"), "");
+  });
+
+  it("never leaves two holders when waiters race to reclaim one stale lock", async (t) => {
+    const statePath = tempStatePath(t);
+    const lockPath = `${statePath}.lock`;
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({ pid: 123, hostname: "crashed-host", acquiredAt: 1_000, nonce: "stale" }),
+      { mode: 0o600 },
+    );
+    const [a, b, c] = [0, 1, 2].map(() =>
+      createRotationStateStore({ path: statePath, staleLockMs: 30_000, lockPollMs: 1 }),
+    );
+    let holders = 0;
+    let maxHolders = 0;
+    const runs: Promise<void>[] = [];
+    const hold = (store: ReturnType<typeof createRotationStateStore>) => {
+      runs.push(
+        store.withLock(async () => {
+          maxHolders = Math.max(maxHolders, ++holders);
+          await delay(20);
+          holders -= 1;
+        }),
+      );
+    };
+
+    // A observes the stale lock, then B reclaims it and takes the lock. While A
+    // is mid-reclaim, C competes. Renaming aside and restoring let C take the
+    // emptied path, then put B's lock back over C's: two holders.
+    const realRead = fs.readFileSync;
+    let reads = 0;
+    let injecting = false;
+    const read = t.mock.method(
+      fs,
+      "readFileSync",
+      (file: fs.PathOrFileDescriptor, options?: Parameters<typeof fs.readFileSync>[1]) => {
+        const out = realRead(file, options);
+        // Only A's reads count, not those of the waiters injected into it.
+        if (!injecting && reads < 2 && String(file).startsWith(lockPath)) {
+          reads += 1;
+          injecting = true;
+          hold(reads === 1 ? b! : c!);
+          injecting = false;
+        }
+        return out;
+      },
+    );
+    // A's first attempt, and B's and C's nested inside it, run synchronously.
+    hold(a!);
+    read.mock.restore();
+    await Promise.all(runs);
+
+    assert.equal(reads, 2);
+    assert.equal(maxHolders, 1);
+    assert.deepEqual(reclaimClaims(lockPath), []);
+  });
+
+  it("fails closed, naming the claim a crashed reclaimer left behind", async (t) => {
+    const statePath = tempStatePath(t);
+    const lockPath = `${statePath}.lock`;
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    const stale = JSON.stringify({ pid: 123, hostname: "crashed-host", acquiredAt: 1_000, nonce: "stale" });
+    fs.writeFileSync(lockPath, stale, { mode: 0o600 });
+    // A reclaimer died after claiming this lock and before unlinking it.
+    const claim = `${lockPath}.reclaim-${createHash("sha256").update(stale).digest("hex").slice(0, 16)}`;
+    fs.writeFileSync(claim, "", { mode: 0o600 });
+    const store = createRotationStateStore({
+      path: statePath,
+      clock: () => 40_001,
+      staleLockMs: 30_000,
+      lockPollMs: 1,
+      lockTimeoutMs: 0,
+    });
+
+    await assert.rejects(
+      store.withLock(() => {}),
+      (err: unknown) => err instanceof LockTimeoutError && err.message.includes(claim),
+    );
+    assert.equal(fs.readFileSync(lockPath, "utf8"), stale);
+
+    // Deleting the claim by hand, as the message says, lets the reclaim proceed.
+    fs.rmSync(claim);
+    let entered = false;
+    await store.withLock(() => {
+      entered = true;
+    });
+    assert.equal(entered, true);
   });
 
   it("releases the lock and propagates when the callback throws", async (t) => {
@@ -281,7 +437,7 @@ describe("rotation state mutators", () => {
     });
 
     now = 7_000;
-    await store.markSuccess("primary");
+    await store.markSuccess("primary", 6_500);
     assert.deepEqual(store.load().accounts.primary, {
       cooldownUntil: null,
       disabled: false,
@@ -289,6 +445,24 @@ describe("rotation state mutators", () => {
       lastReason: "second limit",
       updatedAt: 7_000,
     });
+  });
+
+  it("keeps a cooldown recorded after the successful request was sent", async (t) => {
+    let now = 5_000;
+    const store = createRotationStateStore({
+      path: tempStatePath(t),
+      clock: () => now,
+    });
+    const sentAt = now;
+
+    // A concurrent request's 429 lands while this one is still in flight.
+    now = 6_000;
+    await store.markCooldown("primary", 3_606_000, "limited");
+    const cooled = store.load().accounts.primary;
+
+    now = 7_000;
+    await store.markSuccess("primary", sentAt);
+    assert.deepEqual(store.load().accounts.primary, cooled);
   });
 
   it("ensureAccount is idempotent and does not clobber existing state", async (t) => {

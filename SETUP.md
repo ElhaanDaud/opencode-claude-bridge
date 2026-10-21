@@ -176,7 +176,7 @@ Auto-enrollment deliberately does nothing when:
 | Situation | Why |
 | --- | --- |
 | The pool is empty | Installing the plugin must never capture credentials from someone who has not opted in. Enroll one account by hand first. |
-| The account is already pooled | Matched by refresh token, then by email, so a re-login of the same account refreshes its entry instead of duplicating it |
+| The account is already pooled | Matched by refresh token, then by email, so a re-login of the same account never duplicates it. Its entry keeps its own tokens unless rotation has disabled it; then a newer login repairs and re-enables it |
 | The CLI credential is expired | It would enter the pool only to fail its first request and be disabled |
 | The account email cannot be resolved | There is no basis for a label; use `claude-pool enroll <label>` |
 
@@ -238,6 +238,7 @@ node scripts/qa-rotation.mjs s3   # run one scenario (s1–s10)
 | `~/.local/share/opencode/auth.json` | OpenCode's single `anthropic` slot — a mirror of the active account | `0600` |
 | `~/.local/share/opencode-claude-bridge/rotation-state.json` | Active account, cooldowns, failure counts. No secrets | `0600` |
 | `~/.local/share/opencode-claude-bridge/refresh-journal.json` | Transient; exists only mid-refresh | `0600` |
+| `~/.local/share/opencode-claude-bridge/refresh-journal.json.<id>.stale` | A journal set aside because its account was removed or re-enrolled. May hold a live token; delete once the account works | `0600` |
 
 If `CLAUDE_CONFIG_DIR` is set, the Claude CLI credential lives at
 `$CLAUDE_CONFIG_DIR/.credentials.json` instead of `~/.claude/` — the bridge

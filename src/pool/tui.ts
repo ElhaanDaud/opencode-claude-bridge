@@ -103,14 +103,15 @@ export function findRedundant(accounts: PoolSnapshotRow[]): Set<string> {
     list.push(account);
     byEmail.set(account.email, list);
   }
+  const rank = { ready: 0, cooling: 1, disabled: 2 } as const;
   const redundant = new Set<string>();
   for (const group of byEmail.values()) {
     if (group.length < 2) continue;
-    const keep =
-      group.find((a) => a.active) ??
-      group.find((a) => a.status === "ready") ??
-      group.find((a) => a.status === "cooling") ??
-      group[0];
+    // Health first: a dead entry can still be activeLabel (markDisabled leaves
+    // it set), so "active" only breaks ties between equally healthy siblings.
+    const keep = [...group].sort(
+      (left, right) => rank[left.status] - rank[right.status] || Number(right.active) - Number(left.active),
+    )[0];
     for (const account of group) {
       if (account.label !== keep.label) redundant.add(account.label);
     }
@@ -478,16 +479,25 @@ export function createPoolTui(deps: TuiDeps) {
     while (i < chunk.length) {
       if (chunk[i] === "\u001b") {
         const rest = chunk.slice(i);
-        const csi = rest.match(/^\u001b\[[0-9;]*[A-Za-z~]/);
-        if (csi) {
-          keys.push(csi[0]);
-          i += csi[0].length;
+        const seq = rest.match(/^\u001b(?:\[[0-9;]*[A-Za-z~]|O[A-Za-z])/);
+        if (seq) {
+          // Terminals in application-cursor mode send SS3 ("\u001bOA") for the
+          // keys onKey knows as CSI, so map it onto the CSI form.
+          keys.push(seq[0].replace(/^\u001bO/, "\u001b["));
+          i += seq[0].length;
           continue;
         }
         // A bare ESC, or a sequence truncated at the chunk boundary: hold it
         // so the next chunk can complete it.
-        pendingEscape = rest;
-        return keys;
+        if (/^\u001b(?:\[[0-9;]*|O)?$/.test(rest)) {
+          pendingEscape = rest;
+          return keys;
+        }
+        // Anything else (Esc then more input, Alt+key) is a lone ESC. Holding
+        // it would prefix every later chunk and swallow q and ctrl-c for good.
+        keys.push("\u001b");
+        i += 1;
+        continue;
       }
       keys.push(chunk[i]!);
       i += 1;

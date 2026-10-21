@@ -4,7 +4,7 @@ import http from "node:http";
 import https from "node:https";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +13,10 @@ import { spawn } from "node:child_process";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 const distPluginPath = join(repoRoot, "dist", "index.js");
-const promptCachePath = join(homedir(), ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
+// Same lookup as SYSTEM_PROMPT_CACHE_PATH in src/index.ts.
+const promptCachePath = process.env.ANTHROPIC_SYSTEM_PROMPT_PATH
+  || join(homedir(), ".cache", "opencode-claude-bridge", "claude-system-prompt.json");
+const commandTimeoutMs = 5 * 60_000;
 
 function parseArgs(argv) {
   const args = {
@@ -217,9 +220,25 @@ function runCommand(command, args, options = {}) {
 
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    // 'close' may or may not follow 'error' (e.g. spawn ENOENT), so settle once.
+    const finish = (code, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise({ code, stdout, stderr, error });
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      // A grandchild can hold the pipes open after the kill.
+      child.stdout.destroy();
+      child.stderr.destroy();
+      finish(-1, `timed out after ${commandTimeoutMs / 1000}s`);
+    }, commandTimeoutMs);
     child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    child.on("close", (code) => resolvePromise({ code: code ?? -1, stdout, stderr }));
+    child.on("error", (error) => finish(-1, error.message));
+    child.on("close", (code) => finish(code ?? -1));
   });
 }
 
@@ -424,6 +443,9 @@ function printUsage(label, usage) {
 
 function printCommandResult(label, result) {
   console.log(`\n${label} exit=${result.code}`);
+  if (result.error) {
+    console.log(`${label} error: ${result.error}`);
+  }
   if (result.stdout.trim()) {
     console.log(`${label} stdout:\n${result.stdout.trim()}`);
   }
@@ -435,6 +457,7 @@ function printCommandResult(label, result) {
 function writePromptCache(captures) {
   const messageCapture = firstMessageCapture(captures);
   if (!messageCapture) return false;
+  let tempPath = null;
   try {
     const parsed = JSON.parse(messageCapture.body);
     if (!Array.isArray(parsed.system) || parsed.system.length < 2) return false;
@@ -443,7 +466,9 @@ function writePromptCache(captures) {
       ? billingText.match(/cc_version=([^;]+);\s*cc_entrypoint=([^;]+);/)
       : null;
     mkdirSync(dirname(promptCachePath), { recursive: true });
-    writeFileSync(promptCachePath, JSON.stringify({
+    // Write then rename, so the bridge never reads a half-written file.
+    tempPath = `${promptCachePath}.${process.pid}.tmp`;
+    writeFileSync(tempPath, JSON.stringify({
       source: "claude-code-capture",
       updated_at: new Date().toISOString(),
       billing: billingMatch ? {
@@ -453,10 +478,19 @@ function writePromptCache(captures) {
       } : undefined,
       system: parsed.system.slice(1),
     }, null, 2));
+    renameSync(tempPath, promptCachePath);
     return true;
   } catch {
+    if (tempPath) rmSync(tempPath, { force: true });
     return false;
   }
+}
+
+function runFailure(label, run) {
+  if (run.result.error) return `${label} failed: ${run.result.error}`;
+  if (run.result.code !== 0) return `${label} exited with code ${run.result.code}`;
+  if (!firstMessageCapture(run.captures)) return `${label} sent no /v1/messages request`;
+  return null;
 }
 
 function summarizeRun(run) {
@@ -491,6 +525,7 @@ async function main() {
   };
   let claudeRun = null;
   let openCodeRun = null;
+  const failures = [];
 
   report.usage.before = await safeFetchUsage(accessToken);
   printUsage("Usage before", report.usage.before);
@@ -499,6 +534,7 @@ async function main() {
     claudeRun = await captureClaudeCode(args);
     report.claude = summarizeRun(claudeRun);
     printCommandResult("Claude Code", claudeRun.result);
+    failures.push(runFailure("Claude Code", claudeRun));
     report.claude.promptCacheWritten = writePromptCache(claudeRun.captures);
     report.usage.afterClaude = await safeFetchUsage(accessToken);
     printUsage("Usage after Claude Code", report.usage.afterClaude);
@@ -511,6 +547,7 @@ async function main() {
     });
     report.opencode = summarizeRun(openCodeRun);
     printCommandResult("OpenCode", openCodeRun.result);
+    failures.push(runFailure("OpenCode", openCodeRun));
     report.usage.afterOpenCode = await safeFetchUsage(accessToken);
     printUsage("Usage after OpenCode", report.usage.afterOpenCode);
   }
@@ -535,6 +572,12 @@ async function main() {
       console.log(`Missing tools: ${report.comparison.bodyShape.toolNames.missingFromOpenCode.length}`);
       console.log(`Extra tools: ${report.comparison.bodyShape.toolNames.extraInOpenCode.length}`);
     }
+  }
+
+  const failed = failures.filter(Boolean);
+  if (failed.length > 0) {
+    console.error(`\nValidation failed:\n${failed.map((failure) => `- ${failure}`).join("\n")}`);
+    process.exitCode = 1;
   }
 }
 

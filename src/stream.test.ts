@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { KEEPALIVE_FRAME, translateSseStream } from "./stream.js";
+import { KEEPALIVE_FRAME, createSseProcessor, translateSseStream } from "./stream.js";
 
 const encoder = new TextEncoder();
 const ev = (event: string, data: unknown) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -51,6 +51,31 @@ function harness(keepaliveMs: number) {
     logs,
   };
 }
+
+describe("createSseProcessor line endings", () => {
+  const feed = (chunks: string[]) => {
+    const proc = createSseProcessor({
+      inboundToolNameMap: { Write: "write" },
+      translateToolArgs: (json) => json.replace('"file_path"', '"filePath"'),
+    });
+    const live = chunks.map((c) => proc.feedChunk(c)).join("");
+    return { live, rest: proc.flush() };
+  };
+  const LF = START + DELTA + STOP;
+  const expected = feed([LF]).live;
+
+  for (const [name, eol] of [["LF", "\n"], ["CRLF", "\r\n"], ["CR", "\r"]] as const) {
+    it(`translates a tool_use framed with ${name}`, () => {
+      const input = LF.replace(/\n/g, eol);
+      // Whole, one character per chunk (splitting every CRLF pair), and with
+      // empty chunks in between.
+      for (const chunks of [[input], [...input], [...input].flatMap((c) => [c, ""])]) {
+        assert.deepEqual(feed(chunks), { live: expected, rest: "" });
+      }
+      assert.ok(expected.includes('"name":"write"') && expected.includes('\\"filePath\\"'));
+    });
+  }
+});
 
 describe("translateSseStream keepalive", () => {
   it("sends keepalive comments while a tool_use block is buffered", async () => {

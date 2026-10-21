@@ -205,6 +205,7 @@ The bridge ships a fallback catalog, used only for model IDs that OpenCode's own
 - **Sonnet 5.5** rejects both `{type:"enabled", budget_tokens}` and `{type:"disabled"}`. `enabled` is rewritten to `adaptive`.
 - **Haiku 5.5** rejects `{type:"enabled"}`, which is rewritten to `adaptive`.
 - `temperature` is forced to `1` whenever thinking is enabled or adaptive, which the API requires.
+- A forced `tool_choice` (`any`, or a named `tool`) can't be combined with thinking, so the forced tool wins: no thinking is injected, and the caller's `enabled` or `adaptive` thinking becomes `disabled`. A named tool is renamed to its Claude Code name. Sonnet 5.5 can't turn thinking off, so it drops a forced `tool_choice` instead and keeps thinking; `auto` and `none` still pass through.
 
 ### Dynamic fingerprint computation
 
@@ -258,15 +259,17 @@ node scripts/claude-pool.mjs install-hook >> ~/.zshrc && source ~/.zshrc
 ```
 
 Accounts are matched by refresh token, then by email, so re-logging into a
-pooled account refreshes its entry instead of duplicating it. Set
-`CLAUDE_POOL_AUTO_ENROLL=0` to disable.
+pooled account never duplicates it. A healthy entry keeps its own tokens, since
+sharing one login with the Claude CLI logs one side out; an entry that rotation
+has disabled, for example after its refresh was rejected, is repaired from the
+newer login and re-enabled. Set `CLAUDE_POOL_AUTO_ENROLL=0` to disable.
 
 ### Commands
 
 | Command | Purpose |
 | --- | --- |
 | `claude-pool enroll [label] [--replace]` | Add the account Claude CLI is logged into |
-| `claude-pool auto` | Enroll the logged-in account only if the pool has not seen it |
+| `claude-pool auto` | Enroll the logged-in account if the pool has not seen it, or repair its disabled entry from a newer login. Does nothing while the pool is empty |
 | `claude-pool install-hook` | Print a shell function that runs `auto` after `claude login` |
 | `claude-pool whoami` | Show which account Claude CLI is logged into, and whether it is pooled |
 | `claude-pool status` | Active account and what rotation would pick next |
@@ -293,7 +296,7 @@ Every failed response is classified before the response body is read:
 
 | Signal | Action |
 | --- | --- |
-| `429` with a reset of 60s or less | Back off, retry the **same** account (up to 3 attempts, then rotate) |
+| `429` with a reset of 60s or less | Back off, retry the **same** account (up to 3 attempts within the wait budget below, then rotate) |
 | `429` with a longer reset, or `anthropic-ratelimit-unified-status` not `allowed` | Cool the account down until its reset, switch accounts |
 | `429` with no determinable reset | Cool down for 1 hour, switch |
 | `403` whose body says suspended / disabled / banned | Disable the account, switch |
@@ -301,6 +304,12 @@ Every failed response is classified before the response body is read:
 | `401` | Credential rejected even after refresh — disable, switch |
 | `5xx` | Retry the same account with exponential backoff (1s, 2s, 4s), then pass through |
 | Every account cooling | Fail fast as `429`, naming each account and the earliest reset |
+
+Retries in place share one 10s wait budget per request, across every account.
+A retry that would overrun it is not slept: a `429` cools the account down until
+its reset and rotates, a `5xx` passes through. A pool answering "retry in 60s"
+everywhere therefore fails fast, and OpenCode's own retry, which shows the wait,
+takes over.
 
 A 401/403 penalty is only applied once **another account succeeds** with the
 same request. If the next account fails identically, the request is blamed and
@@ -336,7 +345,8 @@ old one immediately, with no grace window. Losing the replacement permanently
 locks you out of that account.
 
 Refreshes therefore journal the new tokens to disk before committing them to
-the keychain, and any journal found at startup is replayed. Concurrent
+the keychain, and any journal found at startup is replayed (or renamed aside,
+never deleted, if its account was since removed or re-enrolled). Concurrent
 refreshes of one account collapse into a single call, since two parallel
 refreshes would spend the same token twice. Across processes, refreshes are
 serialised by the rotation lock. A stale lock is reclaimed only once its holder
@@ -401,7 +411,7 @@ The validator will:
 - Query the OAuth usage endpoint before and after each run
 - Capture an official Claude Code request through a local proxy
 - Capture an OpenCode request using this repo's local `dist/index.js`
-- Write Claude Code's captured system prompt to `~/.cache/opencode-claude-bridge/claude-system-prompt.json`
+- Write Claude Code's captured system prompt to `~/.cache/opencode-claude-bridge/claude-system-prompt.json` (or `ANTHROPIC_SYSTEM_PROMPT_PATH`, if set)
 - Save request and response artifacts under `tmp/validate-*`
 - Write a `report.json` with request diffs, body hashes, and usage snapshots
 
@@ -420,7 +430,7 @@ When Claude Code updates, the required headers or body fields may change. To cap
 ./scripts/intercept-claude.sh claude-sonnet-4-6
 ```
 
-This starts a local proxy, runs Claude CLI through it with OAuth, and saves the full request headers and body to `/tmp/claude-intercept-*`. Compare against the plugin's constants and fetch wrapper to spot differences.
+This starts a local proxy, runs Claude CLI through it with OAuth, and saves the request headers (credentials redacted) and body to a private `/tmp/claude-intercept.XXXXXX/` directory. Compare against the plugin's constants and fetch wrapper to spot differences.
 
 Key things that have changed across versions:
 

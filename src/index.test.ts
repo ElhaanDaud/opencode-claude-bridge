@@ -33,6 +33,7 @@ import {
   stripAssistantPrefillForClaude,
   stripMessageCacheControlPreservingTail,
   mergeClaudeSystemPrompt,
+  normalizeSystemBlocks,
   stripSystemCacheControl,
   supportsAdaptiveThinking,
 } from "./index.js";
@@ -347,6 +348,28 @@ describe("system prompt merge", () => {
       "agent prompt",
       "AGENTS.md rules",
     ]);
+  });
+});
+
+describe("system prompt without a captured Claude Code prompt", () => {
+  it("renames OpenCode as a word but not inside paths, URLs or names", () => {
+    const out = normalizeSystemBlocks([{
+      type: "text",
+      text: [
+        "You are OpenCode, the best coding agent on the planet.",
+        "For OpenCode's features see https://opencode.ai/docs or https://github.com/anomalyco/opencode.",
+        "Working directory: /Users/me/src/opencode-claude-bridge",
+        "Config: opencode.json, .opencode/, ~/.config/opencode/AGENTS.md, /Applications/OpenCode.app",
+        "Skills: customize-opencode, from OhMyOpenCode. Built for OpenCode.",
+      ].join("\n"),
+    }]);
+    assert.equal(out[0]?.text, [
+      "You are Claude Code, the best coding agent on the planet.",
+      "For Claude Code's features see https://opencode.ai/docs or https://github.com/anomalyco/opencode.",
+      "Working directory: /Users/me/src/opencode-claude-bridge",
+      "Config: opencode.json, .opencode/, ~/.config/opencode/AGENTS.md, /Applications/OpenCode.app",
+      "Skills: customize-opencode, from OhMyOpenCode. Built for Claude Code.",
+    ].join("\n"));
   });
 });
 
@@ -852,6 +875,13 @@ describe("translateArgsOpencodeToClaude", () => {
     });
   });
 
+  it("skips null and non-object AskUserQuestion items instead of throwing", () => {
+    const out = translateArgsOpencodeToClaude("AskUserQuestion", {
+      questions: [null, "x", { question: "Which?", multiple: true }],
+    });
+    assert.deepEqual(out, { questions: [null, "x", { question: "Which?", multiSelect: true }] });
+  });
+
   it("synthesizes a WebFetch prompt from format (markdown)", () => {
     const out = translateArgsOpencodeToClaude("WebFetch", {
       url: "https://example.com",
@@ -901,6 +931,13 @@ describe("translateArgsOpencodeToClaude", () => {
         { content: "b", status: "completed", activeForm: "Was doing b" },
       ],
     });
+  });
+
+  it("skips null and non-object TodoWrite items instead of throwing", () => {
+    const out = translateArgsOpencodeToClaude("TodoWrite", {
+      todos: [null, 7, { content: "a", status: "cancelled", priority: "Doing a" }],
+    });
+    assert.deepEqual(out, { todos: [null, 7, { content: "a", status: "completed", activeForm: "Doing a" }] });
   });
 
   it("maps plan_enter → EnterPlanMode with empty args (outbound)", () => {

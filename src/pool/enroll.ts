@@ -178,6 +178,16 @@ function findByEmail(accounts: AccountRecord[], email: string | undefined): Acco
   return accounts.find((a) => a.email?.toLowerCase() === wanted);
 }
 
+/**
+ * Whether a CLI login may replace the pooled entry for the same account. Once
+ * the pool has refreshed, the CLI's copy holds a refresh token the server has
+ * invalidated. A fresh login always expires later than the pool's copy; a
+ * stale copy never does.
+ */
+function supersedes(oauth: ClaudeCliCredentials["claudeAiOauth"], pooled: AccountRecord): boolean {
+  return oauth.refreshToken === pooled.oauth.refresh || oauth.expiresAt > pooled.oauth.expires;
+}
+
 function firstFreeLabel(base: string, accounts: AccountRecord[]): string {
   const taken = new Set(accounts.map((a) => a.label));
   if (!taken.has(base)) return base;
@@ -235,7 +245,13 @@ export async function enrollFromClaudeCli(
 
   if (sameEmail && sameEmail.label !== label) {
     throw new EnrollmentError(
-      `${email} is already enrolled as "${sameEmail.label}". Enroll without a label to refresh its credentials.`,
+      `${email} is already enrolled as "${sameEmail.label}"; an account can hold only one label.`,
+    );
+  }
+
+  if (sameEmail && !supersedes(creds.claudeAiOauth, sameEmail)) {
+    throw new EnrollmentError(
+      `${email} is already enrolled as "${sameEmail.label}" with newer credentials than the Claude CLI's copy; kept the pool's. Run \`claude login\` as this account to replace them.`,
     );
   }
 
@@ -296,6 +312,8 @@ export type AutoEnrollStatus =
   | "enrolled"
   | "already-enrolled"
   | "stale"
+  | "repaired"
+  | "pool-empty"
   | "unavailable"
   | "no-label";
 
@@ -310,11 +328,13 @@ export interface AutoEnrollOptions {
   clock?: Clock;
   readCredentials?: () => string;
   resolveEmail?: (accessToken: string) => Promise<string | undefined>;
+  /** Whether rotation has disabled the label. Without it, no entry is replaced. */
+  isDisabled?: (label: string) => boolean | Promise<boolean>;
 }
 
 /**
  * Adopt whatever account the Claude CLI is currently logged into, if the pool
- * has not seen it before.
+ * has not seen it before, or repair a disabled entry from a newer login.
  *
  * Accounts are matched by refresh token, then by email: the pool's copy and
  * the CLI's copy stop sharing a refresh token once either refreshes. Never by
@@ -350,6 +370,10 @@ export async function autoEnrollIfNew(
     return { status: "unavailable" };
   }
 
+  // Installing the plugin must never capture credentials from someone who has
+  // not opted in by enrolling an account by hand.
+  if (existing.length === 0) return { status: "pool-empty" };
+
   const known = existing.find((a) => a.oauth.refresh === oauth.refreshToken);
   if (known) return { status: "already-enrolled", label: known.label };
 
@@ -362,7 +386,25 @@ export async function autoEnrollIfNew(
   if (!email) return { status: "no-label" };
 
   const sameEmail = findByEmail(existing, email);
-  if (sameEmail) return { status: "already-enrolled", label: sameEmail.label, email };
+  if (sameEmail) {
+    // Copying the login into a healthy entry would leave the pool and the CLI
+    // sharing one single-use refresh token, so only repair a disabled one.
+    let disabled: boolean;
+    try {
+      disabled = (await opts.isDisabled?.(sameEmail.label)) === true;
+    } catch {
+      disabled = false;
+    }
+    if (!disabled || !supersedes(oauth, sameEmail)) {
+      return { status: "already-enrolled", label: sameEmail.label, email };
+    }
+    try {
+      await opts.accounts.putAccount(toAccountRecord(sameEmail.label, creds, now, email));
+    } catch {
+      return { status: "unavailable" };
+    }
+    return { status: "repaired", label: sameEmail.label, email };
+  }
 
   let label: string;
   try {
