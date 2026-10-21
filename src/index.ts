@@ -34,6 +34,8 @@ import {
   computeFingerprint,
   extractFirstUserMessageText,
   shouldUseClaudeToolSchemas,
+  mergeAgentSchemaWithActiveTask,
+  scrubAbsentToolReferences,
 } from "./claude-tools.js";
 import type { ToolDefinition } from "./claude-tools.js";
 import { translateSseStream } from "./stream.js";
@@ -387,6 +389,7 @@ export function getClaudeToolsForActiveOpenCodeTools(
   if (!Array.isArray(tools)) return [];
   const claudeToolsByName = new Map(getClaudeTools().map((tool) => [tool.name, tool]));
   const selectedToolsByName = new Map<string, ToolDefinition>();
+  const coreNames = new Set<string>();
 
   for (const tool of tools) {
     const name = getToolName(tool);
@@ -396,7 +399,11 @@ export function getClaudeToolsForActiveOpenCodeTools(
     if (claudeName) {
       const claudeTool = claudeToolsByName.get(claudeName);
       if (!claudeTool) continue;
-      selectedToolsByName.set(claudeName, claudeTool);
+      const def = claudeName === "Agent"
+        ? mergeAgentSchemaWithActiveTask(claudeTool, getToolInputSchema(tool))
+        : claudeTool;
+      selectedToolsByName.set(claudeName, def);
+      coreNames.add(claudeName);
       continue;
     }
 
@@ -420,8 +427,9 @@ export function getClaudeToolsForActiveOpenCodeTools(
   // Claude Code's wire order and keeps the serialized prefix byte-stable, since
   // the bridge strips cache_control and relies on implicit prefix caching.
   const byName = (x: ToolDefinition, y: ToolDefinition) => x.name.localeCompare(y.name);
-  const selected = Array.from(selectedToolsByName.values());
-  const isCore = (tool: ToolDefinition) => claudeToolsByName.get(tool.name) === tool;
+  const isCore = (tool: ToolDefinition) => coreNames.has(tool.name);
+  const selected = Array.from(selectedToolsByName.values())
+    .map((tool) => isCore(tool) ? scrubAbsentToolReferences(tool, coreNames) : tool);
   return [...selected.filter(isCore).sort(byName), ...selected.filter((t) => !isCore(t)).sort(byName)];
 }
 

@@ -636,6 +636,56 @@ describe("tool schema selection", () => {
     ]).map((tool) => tool.name).sort();
     assert.deepEqual(out, ["Bash", "Read"]);
   });
+
+  it("merges an OMO task tool's extra fields into the Agent schema", () => {
+    const [agent] = getClaudeToolsForActiveOpenCodeTools([
+      {
+        name: "task",
+        description: "OMO task",
+        input_schema: {
+          type: "object",
+          properties: {
+            prompt: { type: "string" },
+            category: { type: "string" },
+            load_skills: { type: "array", items: { type: "string" } },
+            subagent_type: { type: "string" },
+          },
+          required: ["prompt"],
+        },
+      },
+    ]);
+    const props = (agent.input_schema as any).properties;
+    assert.equal(agent.name, "Agent");
+    assert.ok(props.category, "category merged in");
+    assert.ok(props.load_skills, "load_skills merged in");
+    assert.ok(props.description, "Claude's own fields preserved");
+    assert.deepEqual((agent.input_schema as any).required, ["prompt"]);
+  });
+
+  it("leaves the Agent schema at Claude's wire shape when task declares no extras", () => {
+    const [agent] = getClaudeToolsForActiveOpenCodeTools([{ name: "task" }]);
+    assert.deepEqual(
+      (agent.input_schema as any).required,
+      ["description", "prompt", "subagent_type"],
+    );
+    assert.ok(!("category" in (agent.input_schema as any).properties));
+  });
+
+  it("scrubs Glob/Grep pointers from Bash when those tools are absent", () => {
+    const [bash] = getClaudeToolsForActiveOpenCodeTools([{ name: "bash" }]);
+    assert.ok(!bash.description.includes("Use Glob (NOT find or ls)"));
+    assert.ok(!bash.description.includes("Use Grep (NOT grep or rg)"));
+  });
+
+  it("keeps Glob/Grep pointers in Bash when those tools are active", () => {
+    const [bash] = getClaudeToolsForActiveOpenCodeTools([
+      { name: "bash" },
+      { name: "glob" },
+      { name: "grep" },
+    ]).filter((t) => t.name === "Bash");
+    assert.ok(bash.description.includes("Use Glob (NOT find or ls)"));
+    assert.ok(bash.description.includes("Use Grep (NOT grep or rg)"));
+  });
 });
 
 // ── translateToolArgsJsonString: argument translation on parsed JSON ─────────
@@ -751,7 +801,7 @@ describe("translateToolArgsJsonString", () => {
   });
 
   // Field stripping — Claude sends fields OpenCode's Zod schemas don't accept
-  it("strips Claude-only Agent fields (model, run_in_background, isolation)", () => {
+  it("strips Claude-only Agent fields (model, isolation) but keeps run_in_background", () => {
     const out = translated("Agent", {
       description: "d",
       prompt: "p",
@@ -764,12 +814,34 @@ describe("translateToolArgsJsonString", () => {
       description: "d",
       prompt: "p",
       subagent_type: "general",
+      run_in_background: true,
     });
   });
 
-  it("defaults Agent subagent_type to 'general' when missing (OpenCode requires it)", () => {
+  it("defaults Agent subagent_type to 'general' when both it and category are missing", () => {
     const out = translated("Agent", { description: "d", prompt: "p" });
     assert.equal(out.subagent_type, "general");
+  });
+
+  it("does not add subagent_type when a category selects the agent", () => {
+    const out = translated("Agent", { description: "d", prompt: "p", category: "deep" });
+    assert.equal(out.subagent_type, undefined);
+    assert.equal(out.category, "deep");
+  });
+
+  it("passes Agent category and load_skills through untouched", () => {
+    const out = translated("Agent", {
+      prompt: "p",
+      category: "deep",
+      load_skills: ["git-master"],
+      task_id: "ses_1",
+    });
+    assert.deepEqual(out, {
+      prompt: "p",
+      category: "deep",
+      load_skills: ["git-master"],
+      task_id: "ses_1",
+    });
   });
 
   it("strips Claude-only Bash fields (run_in_background, dangerouslyDisableSandbox)", () => {

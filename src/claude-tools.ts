@@ -171,7 +171,10 @@ export const AGENT_TYPE_OPENCODE_TO_CLAUDE: Record<string, string> = {
  * independent of OpenCode's validation mode.
  */
 const INBOUND_FIELDS_TO_STRIP: Record<string, string[]> = {
-  Agent: ["model", "run_in_background", "isolation"],
+  // run_in_background is NOT stripped: OpenCode task tools that support
+  // background delegation (e.g. OhMyOpenCode) declare it, and ones that don't
+  // drop it in non-strict Zod. model/isolation have no OpenCode counterpart.
+  Agent: ["model", "isolation"],
   Bash: ["run_in_background", "dangerouslyDisableSandbox"],
   Read: ["pages"],
   Grep: ["output_mode", "-B", "-A", "-C", "context", "-n", "-i", "type", "head_limit", "offset", "multiline"],
@@ -260,9 +263,9 @@ export function translateToolArgsJsonString(json: string, toolName: string): str
       out.format = "markdown";
     }
   }
-  if (toolName === "Agent" && typeof out.subagent_type !== "string") {
-    // OpenCode's task tool requires subagent_type. Default to "general"
-    // (the closest equivalent to Claude's default "general-purpose").
+  if (toolName === "Agent" && typeof out.subagent_type !== "string" && typeof out.category !== "string") {
+    // OpenCode's task tool needs subagent_type unless a category selects the
+    // agent (OMO: providing both is rejected). Default only when neither given.
     out.subagent_type = "general";
   }
 
@@ -983,3 +986,73 @@ export const STUB_TOOL_NAMES = new Set(STUB_TOOLS.map((t) => t.name));
 
 /** Names of tools shared between Claude Code and OpenCode. */
 export const SHARED_TOOL_NAMES = new Set(SHARED_TOOLS.map((t) => t.name));
+
+/**
+ * Merge the active OpenCode `task` tool's extra schema into Claude's Agent
+ * definition. Claude's wire schema only knows description/prompt/subagent_type/
+ * model/run_in_background/isolation; OpenCode task tools (OMO) also declare
+ * category, load_skills, task_id and command, and relax `required`. Keeping
+ * Claude's wording for the shared fields leaves a stock OpenCode task
+ * byte-identical on the wire while exposing the extra fields the model needs.
+ */
+export function mergeAgentSchemaWithActiveTask(
+  claudeAgent: ToolDefinition,
+  activeTaskSchema: Record<string, unknown> | undefined,
+): ToolDefinition {
+  const activeProps = activeTaskSchema
+    && typeof activeTaskSchema.properties === "object"
+    && activeTaskSchema.properties !== null
+    ? activeTaskSchema.properties as Record<string, unknown>
+    : undefined;
+  if (!activeProps) return claudeAgent;
+
+  const claudeProps = (claudeAgent.input_schema.properties ?? {}) as Record<string, unknown>;
+  const mergedProps: Record<string, unknown> = { ...claudeProps };
+  for (const [key, def] of Object.entries(activeProps)) {
+    if (!(key in mergedProps)) mergedProps[key] = def;
+  }
+
+  const activeRequired = Array.isArray(activeTaskSchema!.required)
+    ? (activeTaskSchema!.required as unknown[]).filter((x): x is string => typeof x === "string")
+    : undefined;
+
+  return {
+    ...claudeAgent,
+    input_schema: {
+      ...claudeAgent.input_schema,
+      properties: mergedProps,
+      required: activeRequired && activeRequired.length > 0
+        ? activeRequired
+        : claudeAgent.input_schema.required,
+    },
+  };
+}
+
+/**
+ * Drop recommendations to use core tools absent from this request. Claude
+ * Code's Bash/Agent text tells the model to reach for Glob and Grep; when the
+ * OpenCode setup doesn't expose them (e.g. codegraph replaces them) the model
+ * calls an unregistered tool and OpenCode rejects it. No-op (byte-identical)
+ * when Glob/Grep are active.
+ */
+export function scrubAbsentToolReferences(
+  def: ToolDefinition,
+  activeClaudeToolNames: Set<string>,
+): ToolDefinition {
+  let description = def.description;
+  if (def.name === "Bash") {
+    if (!activeClaudeToolNames.has("Glob")) {
+      description = description.replace("\n - File search: Use Glob (NOT find or ls)", "");
+    }
+    if (!activeClaudeToolNames.has("Grep")) {
+      description = description.replace("\n - Content search: Use Grep (NOT grep or rg)", "");
+    }
+  }
+  if (def.name === "Agent" && !activeClaudeToolNames.has("Grep")) {
+    description = description.replace(
+      "use the direct tool: Read for a known path, the Grep tool for a specific symbol or string.",
+      "use the direct tool: Read for a known path.",
+    );
+  }
+  return description === def.description ? def : { ...def, description };
+}
