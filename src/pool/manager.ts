@@ -126,25 +126,30 @@ export function defaultJournalPath(): string {
   );
 }
 
+/** Cooling accounts the exhaustion message names; any beyond are counted. */
+const EXHAUSTION_NAMED_ACCOUNTS = 4;
+
 /**
  * One-line fail-fast message.
  *
  * Deliberately terse: opencode renders session errors as a 5-second toast over
  * the prompt area, with the duration hardcoded at its call site, so a
- * multi-sentence message is unreadable before it vanishes. The per-account
- * breakdown lives in `claude-pool dashboard`, which is where someone can
- * actually study it.
+ * multi-sentence message is unreadable before it vanishes. It names each
+ * cooling account and its wait, soonest first, capped so the line stays short.
+ * The per-account breakdown lives in `claude-pool dashboard`, which is where
+ * someone can actually study it.
  */
 export function describeExhaustion(info: ExhaustionInfo, now: number): string {
   const disabled = info.disabled.length;
   if (info.earliestReset !== null) {
-    const soonest = info.cooling.reduce<{ label: string; until: number } | null>(
-      (best, candidate) => (best === null || candidate.until < best.until ? candidate : best),
-      null,
-    );
+    const [soonest, ...later] = [...info.cooling].sort((left, right) => left.until - right.until);
     const who = soonest ? ` (${soonest.label})` : "";
+    const named = later.slice(0, EXHAUSTION_NAMED_ACCOUNTS - 1);
+    const rest = named.map((c) => `${c.label} in ${formatWait(c.until - now)}`);
+    if (later.length > named.length) rest.push(`+${later.length - named.length} more`);
+    const then = rest.length > 0 ? `, then ${rest.join(", ")}` : "";
     const alsoDisabled = disabled > 0 ? `; ${disabled} disabled` : "";
-    return `Claude pool exhausted — next account free in ${formatWait(info.earliestReset - now)}${who}${alsoDisabled}`;
+    return `Claude pool exhausted — next account free in ${formatWait(info.earliestReset - now)}${who}${then}${alsoDisabled}`;
   }
   if (disabled === 0) {
     // Reachable when this request tried every account but none is cooling or disabled.
@@ -181,6 +186,9 @@ export function createRotationManager(opts: ManagerOptions) {
 
   /** Collapses concurrent in-process refreshes of the same account. */
   const inFlight = new Map<string, Promise<PoolOAuthTokens>>();
+
+  /** Tokens this instance last wrote to auth.json, so an unchanged account isn't rewritten per request. */
+  let lastMirrored: PoolOAuthTokens | null = null;
 
   // ── Journal ───────────────────────────────────────────────────────
 
@@ -359,11 +367,19 @@ export function createRotationManager(opts: ManagerOptions) {
    * Mirror an account's tokens into opencode's single anthropic slot.
    *
    * Best effort: auth.json is only a derived cache of the pool, so a failed
-   * write must not fail a request that already holds a valid token.
+   * write must not fail a request that already holds a valid token. Skipped
+   * when these exact tokens were the last ones written; a failed write is not
+   * remembered, so the next acquire tries again.
    */
   async function mirror(record: AccountRecord): Promise<void> {
+    const { access, refresh, expires } = record.oauth;
+    if (lastMirrored?.access === access && lastMirrored.refresh === refresh && lastMirrored.expires === expires) {
+      return;
+    }
+    lastMirrored = null;
     try {
       await mirrorFn(record.oauth);
+      lastMirrored = { access, refresh, expires };
     } catch (err) {
       let detail = err instanceof Error ? err.message : String(err);
       // The write carried the tokens; keep them out of the log if the error echoes them.

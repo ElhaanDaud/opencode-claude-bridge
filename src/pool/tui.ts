@@ -50,6 +50,9 @@ const YELLOW = style(`${ESC}33m`);
 const RED = style(`${ESC}31m`);
 const CYAN = style(`${ESC}36m`);
 
+/** Signals that end the dashboard; each must restore the terminal first. */
+const EXIT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+
 const STATUS_STYLE: Record<PoolSnapshotRow["status"], { icon: string; color: string }> = {
   ready: { icon: "●", color: GREEN },
   cooling: { icon: "◐", color: YELLOW },
@@ -206,6 +209,8 @@ export function createPoolTui(deps: TuiDeps) {
   let redundant = new Set<string>();
   let timer: NodeJS.Timeout | null = null;
   let exitResolve: (() => void) | null = null;
+  /** Set by a signal that arrived mid-action: exits once that action settles. */
+  let exitAfterAction: (() => void) | null = null;
   /**
    * label -> usage | null (fetch failed) | "expired" (needs an explicit
    * refresh). Absent means "not fetched yet".
@@ -422,6 +427,9 @@ export function createPoolTui(deps: TuiDeps) {
       message = `${RED}${label} failed: ${err instanceof Error ? err.message : String(err)}${RESET}`;
     } finally {
       busy = false;
+      exitAfterAction?.();
+      // Quit mid-action: this action was all that was left to wait for.
+      if (!running) release();
       await reload();
       render();
     }
@@ -684,6 +692,44 @@ export function createPoolTui(deps: TuiDeps) {
     // Not force-exited: the action may be a token refresh, and killing it
     // mid-request can lose the only valid refresh token.
     if (busy) stdout.write("claude-pool: finishing the current action before exiting…\n");
+    else release();
+  }
+
+  /**
+   * Restore the terminal on every exit path. Without this, a SIGINT leaves the
+   * user in the alt screen with a hidden cursor and no echo. Like q, a signal
+   * lets an in-flight action finish first, capped so a hung request cannot
+   * hold the process; a second signal exits at once so the user can always
+   * get out.
+   */
+  function onSignal(signal: NodeJS.Signals): void {
+    const code = signal === "SIGINT" ? 130 : 143;
+    if (running) {
+      // After SIGHUP the terminal is gone and restoring it fails with EIO,
+      // which would crash the process before the action lands.
+      stdin.on("error", () => {});
+      stdout.on("error", () => {});
+    }
+    stop();
+    if (!busy) return process.exit(code);
+    if (exitAfterAction) {
+      // Closing a terminal can deliver SIGHUP twice (the hangup and the exiting
+      // shell), and nobody is left to want out sooner: only INT/TERM forces.
+      if (signal !== "SIGHUP") process.exit(code);
+      return;
+    }
+    // Longer than refreshTokens' worst case: 3 attempts of 30 s and 2 waits of up to 10 s.
+    const cap = setTimeout(() => process.exit(code), 120_000);
+    exitAfterAction = () => {
+      clearTimeout(cap);
+      process.exit(code);
+    };
+  }
+
+  /** Drop the process-wide hooks once nothing is left to restore or wait for. */
+  function release(): void {
+    for (const signal of EXIT_SIGNALS) process.off(signal, onSignal);
+    process.off("exit", stop);
   }
 
   async function start(): Promise<void> {
@@ -730,14 +776,7 @@ export function createPoolTui(deps: TuiDeps) {
       if (running) render();
     });
 
-    // Restore the terminal on every exit path. Without this, a SIGINT leaves
-    // the user in the alt screen with a hidden cursor and no echo.
-    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-      process.once(signal, () => {
-        stop();
-        process.exit(signal === "SIGINT" ? 130 : 143);
-      });
-    }
+    for (const signal of EXIT_SIGNALS) process.on(signal, onSignal);
 
     // Cooldowns are time-based, so the countdown must tick without input.
     timer = setInterval(() => {

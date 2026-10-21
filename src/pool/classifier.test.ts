@@ -101,10 +101,51 @@ describe("classify", () => {
   });
 
   it("permanently disables an account suspended by a 403", () => {
-    const decision = classify(input({ status: 403, bodyText: "Account SUSPENDED by policy" }));
+    const decision = classify(input({
+      status: 403,
+      bodyText: JSON.stringify({
+        type: "error",
+        error: { type: "permission_error", message: "This account has been suspended." },
+      }),
+    }));
 
     assert.equal(decision.action, "ROTATE_DISABLE");
     assert.equal(decision.source, "body-hint");
+    assert.match(decision.reason, /suspended/);
+  });
+
+  it("cools down, never disables, on a non-JSON 403 that mentions a marker", () => {
+    const decision = classify(input({
+      status: 403,
+      bodyText: "<html><body>JavaScript is disabled in your browser.</body></html>",
+    }));
+
+    assert.equal(decision.action, "ROTATE_COOLDOWN");
+    assert.equal(decision.until, NOW + DEFAULT_UNKNOWN_COOLDOWN_MS);
+    assert.equal(decision.source, "default");
+  });
+
+  it("matches account markers only as whole words", () => {
+    for (const message of ["Request undisabled by policy", "revokedness check failed"]) {
+      const decision = classify(input({
+        status: 403,
+        bodyText: JSON.stringify({ type: "error", error: { type: "permission_error", message } }),
+      }));
+
+      assert.equal(decision.action, "ROTATE_COOLDOWN", message);
+    }
+  });
+
+  it("ignores a marker under an error type that is about the request", () => {
+    const decision = classify(input({
+      status: 403,
+      bodyText: JSON.stringify({
+        type: "error",
+        error: { type: "invalid_request_error", message: "Extended thinking is disabled for this model." },
+      }),
+    }));
+
+    assert.equal(decision.action, "ROTATE_COOLDOWN");
   });
 
   it("temporarily cools down a generic 403", () => {
@@ -180,6 +221,16 @@ describe("classify", () => {
 
     assert.equal(decision.action, "RETRY_SAME");
     assert.equal(decision.backoffMs, 30_000);
+    assert.equal(decision.source, "retry-after");
+  });
+
+  it("cools a rejected window for its retry-after when no unified reset is known", () => {
+    const decision = classify(
+      input({ headers: { "anthropic-ratelimit-unified-status": "rejected", "retry-after": "5" } }),
+    );
+
+    assert.equal(decision.action, "ROTATE_COOLDOWN");
+    assert.equal(decision.until, NOW + 5_000);
     assert.equal(decision.source, "retry-after");
   });
 

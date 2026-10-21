@@ -61,6 +61,26 @@ describe("live header calibration: account-level status outranks retry-after", (
     // account whose 5-hour quota is already spent.
     assert.equal(decision.action, "ROTATE_COOLDOWN");
     assert.match(decision.reason, /usage window rejected/i);
+    // Cooling for the retry-after alone returns the account in 5 seconds,
+    // to be rejected again until the spent window resets.
+    assert.equal(decision.until, FIVE_HOUR_RESET_S * 1000);
+    assert.equal(decision.source, "unified-reset");
+  });
+
+  it("keeps a retry-after that outlasts the rejected window", () => {
+    const decision = classify({
+      status: 429,
+      headers: {
+        ...LIVE_ALLOWED_HEADERS,
+        "anthropic-ratelimit-unified-status": "rejected",
+        "retry-after": "7200",
+      },
+      now: NOW,
+    });
+
+    assert.equal(decision.action, "ROTATE_COOLDOWN");
+    assert.equal(decision.until, NOW + 7_200_000);
+    assert.equal(decision.source, "retry-after");
   });
 
   it("still honours a short retry-after while the window is allowed", () => {

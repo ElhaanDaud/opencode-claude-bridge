@@ -62,7 +62,7 @@ const { createRotationStateStore, defaultLockPath, defaultStatePath } = await im
 const { createAccountStore, createSecretBackend } = await import("../dist/pool/secret-store.js");
 const {
   enrollFromClaudeCli, EnrollmentError, readClaudeCliCredentialsRaw, parseClaudeCredentials, lookupEmail, autoEnrollIfNew,
-  labelSharingClaudeCliLogin, sharedLoginWarning,
+  labelSharingClaudeCliLogin, sharedLoginWarning, findByEmail,
 } = await import("../dist/pool/enroll.js");
 const { selectNext } = await import("../dist/pool/selection.js");
 
@@ -194,7 +194,8 @@ async function whoami() {
   }
 
   console.log(`Claude CLI is logged in as: ${email}`);
-  const byEmail = (await accounts.listAccounts()).find((a) => a.email === email);
+  // Case-insensitive, as enrollment matches: the profile may change the case.
+  const byEmail = findByEmail(await accounts.listAccounts(), email);
   console.log(
     byEmail
       ? `That account is in the pool as "${byEmail.label}" (its token has since been rotated).`

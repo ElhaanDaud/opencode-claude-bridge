@@ -138,17 +138,17 @@ The plugin sits between OpenCode and the Anthropic API:
 Supports both OAuth and API key auth:
 
 - **OAuth (Pro/Max)** — Auto-reads your Claude CLI's OAuth tokens from macOS Keychain (or `~/.claude/.credentials.json` on Linux). No browser flow needed. If Claude CLI isn't available, falls back to browser-based OAuth PKCE.
-- **API key** — Works alongside a standard `provider` entry in your OpenCode config with an `apiKey`. The plugin only activates its OAuth handling for the built-in `anthropic` provider; custom API key providers pass through unchanged.
+- **API key** — Log in with the "Claude API Key" method (`opencode auth login --provider anthropic --method "Claude API Key"`, or `/connect` in the TUI) and OpenCode stores the key and sends it as `x-api-key`. A stored key is never replaced by the Claude CLI login or an enrolled pool, and its requests go out exactly as OpenCode sends them, without the Claude Code rewrite. Log in with the OAuth method to switch back. A standard `provider` entry in your OpenCode config with an `apiKey` also works: the plugin only activates its OAuth handling for the built-in `anthropic` provider, so custom API key providers pass through unchanged.
 - **Token refresh** — When tokens expire, three layers are tried: re-read from Keychain, refresh via stored token, refresh via CLI's token.
 
 ### Wire-level request matching
 
 Every outbound OAuth request is rewritten to match what Claude Code sends on the wire:
 
-- **Headers** — `user-agent`, `anthropic-beta`, `anthropic-version`, `x-stainless-*`, `x-claude-code-version`, `x-claude-code-session-id`, and all billing metadata (`cc_version`, `cc_entrypoint`, `cch`).
+- **Headers** — `user-agent`, `anthropic-beta`, `anthropic-version`, `x-app`, `x-stainless-*`, `x-claude-code-session-id` and `anthropic-dangerous-direct-browser-access`; `x-api-key` is removed. The billing metadata (`cc_version`, `cc_entrypoint`, `cch`) is not a header: it is sent as the first system block (`x-anthropic-billing-header: …`).
 - **Body fields** — `thinking` (with effort and `clear_thinking`), `context_management`, `output_config`, `metadata` (session ID, billing info), and `?beta=true` URL parameter.
 - **System prompt** — Claude Code's real system prompt is captured via the validator and cached at `~/.cache/opencode-claude-bridge/claude-system-prompt.json`. The bridge puts it first in every request's system prompt; OpenCode's own system blocks (agent prompt, AGENTS.md, instructions) follow it.
-- **MCP tool prefixing** — OpenCode's MCP tools are prefixed with `mcp_` to match Claude Code's convention.
+- **Custom and MCP tools** — sent under the names OpenCode gives them, with OpenCode's own description and schema, after Claude Code's core tools. No prefix is added and their names are not translated in either direction: only OpenCode's built-in tools with a Claude Code counterpart are renamed (`bash` -> `Bash`), so a tool merely named like one, such as `mcp_bash`, keeps its name.
 
 ### Tool wire-matching (v1.9.0)
 
@@ -322,11 +322,11 @@ Every failed response is classified before the response body is read:
 | `429` with a reset of 60s or less | Back off, retry the **same** account (up to 3 attempts within the wait budget below, then rotate) |
 | `429` with a longer reset, or `anthropic-ratelimit-unified-status` not `allowed` | Cool the account down until its reset, switch accounts |
 | `429` with no determinable reset | Cool down for 1 hour, switch |
-| `403` whose body says suspended / disabled / banned | Disable the account, switch |
-| Other `403` | Cool down for 1 hour, switch |
+| `403` Anthropic JSON error whose message says suspended / disabled / banned / deactivated / revoked | Disable the account, switch |
+| Other `403`, including non-JSON block pages | Cool down for 1 hour, switch |
 | `401` | Credential rejected even after refresh — disable, switch |
 | `5xx` | Retry the same account with exponential backoff (1s, 2s, 4s), then pass through |
-| Every account cooling | Fail fast as `429`, naming each account and the earliest reset |
+| Every account cooling | Fail fast as `429`, naming the cooling accounts soonest first with each one's wait (up to four, then a count) |
 
 Retries in place share one 10s wait budget per request, across every account.
 A retry that would overrun it is not slept: a `429` cools the account down until
@@ -341,7 +341,9 @@ one is merely rate-limited, the error passes through unpenalised.
 
 Reset windows are read from `retry-after`, then Anthropic's
 `anthropic-ratelimit-unified-*` headers (epoch seconds), preferring whichever
-window `representative-claim` reports as binding. When no reset can be
+window `representative-claim` reports as binding. When the unified status
+rejects the account, the cooldown runs until that window resets even if
+`retry-after` is shorter; a longer `retry-after` still wins. When no reset can be
 determined the account is cooled rather than retried, because retrying a truly
 exhausted account is worse than briefly parking a healthy one.
 

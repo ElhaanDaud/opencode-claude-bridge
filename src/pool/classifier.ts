@@ -35,6 +35,11 @@ const ACCOUNT_DISABLED_MARKERS = [
   "revoked",
 ] as const;
 
+const ACCOUNT_DISABLED_PATTERN = new RegExp(`\\b(${ACCOUNT_DISABLED_MARKERS.join("|")})\\b`, "i");
+
+// Error types under which a 403 speaks for the account rather than the request.
+const ACCOUNT_ERROR_TYPES = new Set(["permission_error", "authentication_error", "forbidden"]);
+
 interface ResetWindow {
   seconds: number;
   source: DecisionSource;
@@ -242,6 +247,31 @@ function resolveBodyHint(bodyText: unknown, now: number): ResetWindow | undefine
   }
 }
 
+/**
+ * The marker in an Anthropic error envelope saying the account itself is shut
+ * out. Anything else — a proxy or block page ("JavaScript is disabled"), or a
+ * word that merely contains a marker — must not permanently disable an account.
+ */
+function accountDisabledMarker(bodyText: unknown): string | undefined {
+  try {
+    if (typeof bodyText !== "string") return undefined;
+    const parsed = JSON.parse(bodyText) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    if (Reflect.get(parsed, "type") !== "error") return undefined;
+
+    const error = Reflect.get(parsed, "error");
+    if (typeof error !== "object" || error === null) return undefined;
+    const type = Reflect.get(error, "type");
+    const message = Reflect.get(error, "message");
+    if (typeof type !== "string" || !ACCOUNT_ERROR_TYPES.has(type)) return undefined;
+    if (typeof message !== "string") return undefined;
+
+    return message.match(ACCOUNT_DISABLED_PATTERN)?.[1]?.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
 function safeDurationMs(seconds: number): number {
   const milliseconds = seconds * 1000;
   return Number.isFinite(milliseconds) ? milliseconds : Number.MAX_SAFE_INTEGER;
@@ -335,8 +365,7 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
   }
 
   if (status === 403) {
-    const body = typeof input.bodyText === "string" ? input.bodyText.toLowerCase() : "";
-    const marker = ACCOUNT_DISABLED_MARKERS.find((candidate) => body.includes(candidate));
+    const marker = accountDisabledMarker(input.bodyText);
     if (marker !== undefined) {
       return {
         action: "ROTATE_DISABLE",
@@ -353,9 +382,11 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
   }
 
   if (status === 429) {
+    const retryAfter = resolveRetryAfter(input.headers, now);
+    const unifiedReset = resolveUnifiedReset(input.headers, now);
     const reset =
-      resolveRetryAfter(input.headers, now) ??
-      resolveUnifiedReset(input.headers, now) ??
+      retryAfter ??
+      unifiedReset ??
       resolveTokenReset(input.headers, now) ??
       resolveBodyHint(input.bodyText, now);
 
@@ -365,14 +396,20 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
     const windows = resolveWindows(input.headers, now);
 
     if (unifiedStatusRejects(input.headers)) {
-      const durationMs = reset
-        ? safeDurationMs(reset.seconds)
+      // Cool until the spent window resets: a shorter retry-after would bring
+      // the account back early, only to be rejected again. A longer one wins.
+      const cooldown =
+        unifiedReset !== undefined && (retryAfter?.seconds ?? 0) <= unifiedReset.seconds
+          ? unifiedReset
+          : reset;
+      const durationMs = cooldown
+        ? safeDurationMs(cooldown.seconds)
         : DEFAULT_UNKNOWN_COOLDOWN_MS;
       return {
         action: "ROTATE_COOLDOWN",
         until: safeUntil(now, durationMs),
-        reason: `Account usage window rejected by Anthropic${reset ? `; resets in ${reset.seconds} seconds` : ""}`,
-        source: reset?.source ?? "default",
+        reason: `Account usage window rejected by Anthropic${cooldown ? `; resets in ${cooldown.seconds} seconds` : ""}`,
+        source: cooldown?.source ?? "default",
         windows,
       };
     }

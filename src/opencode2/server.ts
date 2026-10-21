@@ -249,16 +249,16 @@ function toCredential(tokens: OAuthTokens, metadata?: Record<string, unknown>): 
  * Refresh tokens are single-use, so concurrent callers share one request, and
  * any later caller still holding the spent token gets that result rather than
  * sending it again. V2 stores the new pair only after this returns, so when
- * that write fails, this is its only copy. The request itself is sent once
- * (`retries: 1`): after one that may have reached the server, a resend can
- * only hit a spent token.
+ * that write fails, this is its only copy. refreshTokens itself resends only
+ * a request that never reached the server or was answered 429/529, so a token
+ * the server may have spent is not sent again.
  */
 function createRefresher(): (credential: V2OAuthCredential) => Promise<V2OAuthCredential> {
   const flights = new Map<string, Promise<V2OAuthCredential>>();
   return (credential) => {
     const existing = flights.get(credential.refresh);
     if (existing) return existing;
-    const flight = refreshTokens(credential.refresh, 1).then((tokens) => toCredential(tokens, credential.metadata));
+    const flight = refreshTokens(credential.refresh).then((tokens) => toCredential(tokens, credential.metadata));
     flights.set(credential.refresh, flight);
     // A failure may not have reached the server; the token may be tried again after a pause.
     flight.catch(() => setTimeout(() => flights.delete(credential.refresh), 10_000).unref());

@@ -473,6 +473,7 @@ const scenarios = {
       const problems = [];
       if (cooling.length < 2) problems.push("both accounts not cooling after the first run");
       if (!/pool|exhaust|cooling|resets?/i.test(r.output)) problems.push("V2 did not show a pool-exhausted message");
+      else if (!/\((?:a\), then b|b\), then a) in /.test(r.output)) problems.push("pool-exhausted message does not name both accounts");
       if (sent > 0) problems.push(`${sent} request(s) still sent upstream while the pool was exhausted`);
       const killed = r.timedOut ? `, still running after ${RETRY_TIMEOUT_MS / 1000}s (killed)` : "";
       return done(problems, `cooling=[${cooling}], first run sent ${before}, second run sent ${sent}${killed}, V2 printed: "${brief(r.output)}"`);

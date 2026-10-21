@@ -51,16 +51,20 @@ type Reply = { status: number; body?: string; headers?: Record<string, string> }
 
 const realFetch = globalThis.fetch;
 const realHome = process.env.HOME;
+const realClaudeDir = process.env.CLAUDE_CONFIG_DIR;
 let home = "";
 
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), "single-account-"));
   process.env.HOME = home;
+  process.env.CLAUDE_CONFIG_DIR = path.join(home, ".claude");
 });
 
 afterEach(() => {
   globalThis.fetch = realFetch;
   process.env.HOME = realHome;
+  if (realClaudeDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = realClaudeDir;
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -126,13 +130,18 @@ describe("single-account retry", () => {
 
 type StoredAuth = { type: string; access: string; refresh: string; expires: number };
 
-/** A loaded fetch whose getAuth() re-reads `store`, as OpenCode's does. */
-async function connect(store: { auth: StoredAuth }, save: (body: StoredAuth) => Promise<void>) {
+/** A loaded fetch whose getAuth() re-reads `store`, as OpenCode's does; `status` answers each bearer. */
+async function connect(
+  store: { auth: StoredAuth },
+  save: (body: StoredAuth) => Promise<void>,
+  status: (bearer: string) => number = () => 200,
+) {
   const bearers: string[] = [];
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     if (!String(url).includes("/v1/messages")) return new Response("{}", { status: 404 });
-    bearers.push((init?.headers as Record<string, string>).authorization!);
-    return new Response(OK.body, { status: 200 });
+    const bearer = (init?.headers as Record<string, string>).authorization!;
+    bearers.push(bearer);
+    return new Response(OK.body, { status: status(bearer) });
   }) as typeof fetch;
 
   const hooks = await plugin.server({
@@ -149,6 +158,18 @@ async function connect(store: { auth: StoredAuth }, save: (body: StoredAuth) => 
   };
   return { call, bearers };
 }
+
+/** Logs the Claude CLI in with tokens valid for an hour. */
+function cliLogin(access: string, refresh: string) {
+  fs.mkdirSync(process.env.CLAUDE_CONFIG_DIR!, { recursive: true });
+  fs.writeFileSync(
+    path.join(process.env.CLAUDE_CONFIG_DIR!, ".credentials.json"),
+    JSON.stringify({ claudeAiOauth: { accessToken: access, refreshToken: refresh, expiresAt: Date.now() + 3_600_000 } }),
+  );
+}
+
+/** Anthropic accepting only access tokens the token endpoint just issued. */
+const refreshedOnly = (bearer: string) => (bearer.endsWith("/access") ? 200 : 401);
 
 describe("single-account refresh", () => {
   it("shares one refresh between concurrent requests", async () => {
@@ -178,6 +199,67 @@ describe("single-account refresh", () => {
     assert.deepEqual(refreshRequests.slice(before), ["unsaved"]);
     assert.deepEqual(bearers, ["Bearer unsaved/access", "Bearer unsaved/access"]);
     assert.equal(store.auth.refresh, "unsaved/next");
+  });
+
+  it("refreshes a rejected token the Claude CLI also holds, and resends", async () => {
+    // Plugin init copies the CLI login into the store, so both hold one token.
+    liveRefreshTokens.add("copied-refresh");
+    cliLogin("copied", "copied-refresh");
+    const store = { auth: { type: "oauth", access: "copied", refresh: "copied-refresh", expires: Date.now() + 3_600_000 } };
+    const { call, bearers } = await connect(store, async (body) => { store.auth = body; }, refreshedOnly);
+    const before = refreshRequests.length;
+
+    assert.equal(await call(), 200);
+    assert.deepEqual(refreshRequests.slice(before), ["copied-refresh"]);
+    assert.deepEqual(bearers, ["Bearer copied", "Bearer copied-refresh/access"]);
+  });
+
+  it("shares one refresh between concurrent requests whose token was rejected", async () => {
+    liveRefreshTokens.add("twice-refresh");
+    cliLogin("twice", "twice-refresh");
+    const store = { auth: { type: "oauth", access: "twice", refresh: "twice-refresh", expires: Date.now() + 3_600_000 } };
+    const { call, bearers } = await connect(store, async (body) => { store.auth = body; }, refreshedOnly);
+    const before = refreshRequests.length;
+
+    assert.deepEqual(await Promise.all([call(), call()]), [200, 200]);
+    assert.deepEqual(refreshRequests.slice(before), ["twice-refresh"]);
+    assert.deepEqual([...bearers].sort(), ["Bearer twice", "Bearer twice", "Bearer twice-refresh/access", "Bearer twice-refresh/access"]);
+  });
+
+  it("takes no rejected token back from a refresh already in flight", async () => {
+    liveRefreshTokens.add("early");
+    const store = { auth: { type: "oauth", access: "old", refresh: "early", expires: Date.now() - 1000 } };
+    let saved!: () => void;
+    const saving = new Promise<void>((resolve) => { saved = resolve; });
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    // The first save lands in the store, then hangs until the CLI's token is rejected.
+    const { call, bearers } = await connect(store, async (body) => { store.auth = body; saved(); await gate; }, (bearer) => {
+      if (bearer === "Bearer cli-race") setTimeout(open);
+      return refreshedOnly(bearer);
+    });
+    cliLogin("cli-race", "cli-race-refresh");
+    const before = refreshRequests.length;
+
+    // The first request's refresh takes the CLI's token; the second sends it and is rejected.
+    const first = call();
+    await saving;
+    assert.deepEqual(await Promise.all([first, call()]), [200, 200]);
+    assert.deepEqual(refreshRequests.slice(before), ["early"]);
+    assert.deepEqual(bearers, ["Bearer cli-race", "Bearer early/access", "Bearer early/access"]);
+  });
+
+  it("resends on the Claude CLI's other valid token without spending a refresh token", async () => {
+    const store = { auth: { type: "oauth", access: "stale", refresh: "kept", expires: Date.now() + 3_600_000 } };
+    const { call, bearers } = await connect(store, async (body) => { store.auth = body; }, (bearer) => (bearer === "Bearer stale" ? 401 : 200));
+    // After plugin init, so the store keeps its own token.
+    cliLogin("relogged", "relogged-refresh");
+    const before = refreshRequests.length;
+
+    assert.equal(await call(), 200);
+    assert.deepEqual(refreshRequests.slice(before), []);
+    assert.deepEqual(bearers, ["Bearer stale", "Bearer relogged"]);
+    assert.equal(store.auth.access, "relogged");
   });
 });
 

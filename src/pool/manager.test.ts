@@ -224,6 +224,69 @@ describe("rotation manager token acquisition", () => {
     assert.ok(!errors.some((e) => e.includes("access-alice")), errors.join("\n"));
   });
 
+  it("mirrors into auth.json only when the tokens differ from the last mirror", async (t) => {
+    const h = harness(t, [record("alice"), record("bob")]);
+
+    const cool = (label: string) =>
+      h.manager.applyDecision(label, {
+        action: "ROTATE_COOLDOWN",
+        until: NOW + 7_200_000,
+        reason: "exhausted",
+        source: "retry-after",
+      });
+    const mirrored = () => h.mirrored.map((m) => m.access);
+
+    await h.manager.acquire();
+    await h.manager.acquire();
+    // Each mirror rewrites OpenCode's auth.json; unchanged tokens need no write.
+    assert.deepEqual(mirrored(), ["access-alice"]);
+
+    await cool("alice");
+    await h.manager.acquire();
+    assert.deepEqual(mirrored(), ["access-alice", "access-bob"]);
+
+    // Back to alice with the same tokens: auth.json now holds bob's.
+    await h.manager.markSuccess("alice", NOW);
+    await cool("bob");
+    await h.manager.acquire();
+    assert.deepEqual(mirrored(), ["access-alice", "access-bob", "access-alice"]);
+
+    h.setNow(NOW + 3_600_000);
+    await h.manager.acquire();
+    assert.deepEqual(mirrored(), ["access-alice", "access-bob", "access-alice", "access-alice-v2"]);
+  });
+
+  it("retries a failed mirror on the next acquire", async (t) => {
+    const h = harness(t, [record("alice")]);
+    const attempts: string[] = [];
+    let failing = true;
+    const manager = createRotationManager({
+      accounts: h.accounts,
+      state: h.state,
+      clock: () => NOW,
+      journalPath: h.journalPath,
+      refreshFn: () => {
+        throw new Error("must not refresh a fresh token");
+      },
+      mirrorFn: async (tokens) => {
+        attempts.push(tokens.access);
+        if (failing) throw new Error("auth.set boom");
+      },
+    });
+    const originalError = console.error;
+    console.error = () => {};
+    t.after(() => {
+      console.error = originalError;
+    });
+
+    await manager.acquire();
+    failing = false;
+    await manager.acquire();
+    await manager.acquire();
+
+    assert.deepEqual(attempts, ["access-alice", "access-alice"]);
+  });
+
   it("collapses concurrent refreshes of one account into a single call", async (t) => {
     const h = harness(t, [record("alice", { expires: NOW - 1 })]);
 
@@ -667,6 +730,28 @@ describe("exhaustion messaging", () => {
       NOW,
     );
     assert.match(message, /1h 59m \(bob\)$/);
+  });
+
+  it("names every cooling account soonest first, each with its wait", () => {
+    const message = describeExhaustion(
+      {
+        earliestReset: NOW + 3_600_000,
+        cooling: [
+          { label: "a", until: NOW + 5 * 3_600_000 },
+          { label: "c", until: NOW + 167 * 3_600_000 },
+          { label: "b", until: NOW + 3_600_000 },
+        ],
+        disabled: ["d"],
+      },
+      NOW,
+    );
+    assert.equal(message, "Claude pool exhausted — next account free in 1h (b), then a in 5h, c in 6d 23h; 1 disabled");
+  });
+
+  it("names at most four cooling accounts and counts the rest", () => {
+    const cooling = ["a", "b", "c", "d", "e", "f"].map((label, i) => ({ label, until: NOW + (i + 1) * 60_000 }));
+    const message = describeExhaustion({ earliestReset: NOW + 60_000, cooling, disabled: [] }, NOW);
+    assert.equal(message, "Claude pool exhausted — next account free in 1m (a), then b in 2m, c in 3m, d in 4m, +2 more");
   });
 
   it("mentions disabled accounts alongside the cooling one", () => {

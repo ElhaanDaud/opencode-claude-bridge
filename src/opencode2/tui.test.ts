@@ -53,7 +53,7 @@ test("pool exhausted fires on transition only, with earliest reset", () => {
   const events = diffPoolSnapshots(before, after, NOW);
   assert.equal(events.length, 1);
   assert.equal(events[0]!.variant, "warning");
-  assert.equal(events[0]!.message, "Claude pool exhausted — next account free in 30m (a)");
+  assert.equal(events[0]!.message, "Claude pool exhausted — next account free in 30m (a), then b in 1h 30m");
   assert.equal(events[0]!.dedupeKey, `exhausted:${NOW + 30 * 60_000}`);
   assert.deepEqual(diffPoolSnapshots(after, after, NOW), []);
 });

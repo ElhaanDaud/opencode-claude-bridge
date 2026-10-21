@@ -381,3 +381,141 @@ describe("TUI frame clipping", () => {
     assert.equal(out.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").length, 10);
   });
 });
+
+describe("pool TUI signals", () => {
+  const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+  /** A TUI on a fake TTY whose token refresh (`f`) stays in flight until finish(). */
+  async function signalTui(t: import("node:test").TestContext) {
+    const { EventEmitter } = await import("node:events");
+    let hungUp = false;
+    const eio = () => Object.assign(new Error("EIO"), { code: "EIO" });
+    const stdin = Object.assign(new EventEmitter(), {
+      isTTY: true, resume: () => undefined, pause: () => undefined, setEncoding: () => undefined,
+      // Like tty.ReadStream: a failed tcsetattr is emitted, synchronously.
+      setRawMode: () => (hungUp ? stdin.emit("error", eio()) : undefined),
+    });
+    const writes: string[] = [];
+    const stdout = Object.assign(new EventEmitter(), {
+      isTTY: true, columns: 100, rows: 30,
+      write(chunk: string) {
+        if (hungUp) process.nextTick(() => stdout.emit("error", eio()));
+        else writes.push(chunk);
+        return true;
+      },
+    });
+    const exits: Array<number | undefined> = [];
+    t.mock.method(process, "exit", ((code?: number) => void exits.push(code)) as never);
+    let finish: () => void = () => undefined;
+    const tui = createPoolTui({
+      pool: {
+        snapshot: async () => ({ activeLabel: "a", now: 0, accounts: [row("a", "ready")] }),
+        pendingRefreshLabel: () => null,
+        refreshLabel: () =>
+          new Promise((resolve) => {
+            finish = () => resolve({ access: "new", refresh: "rotated", expires: Date.now() + 3_600_000 });
+          }),
+      } as unknown as TuiDeps["pool"],
+      accounts: {} as TuiDeps["accounts"],
+      state: {} as TuiDeps["state"],
+      enroll: async () => "",
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+    });
+    const listeners = SIGNALS.map((signal) => process.listenerCount(signal));
+    const started = tui.start();
+    await tick();
+    return {
+      stdin,
+      writes,
+      exits,
+      started,
+      hangUp: () => {
+        hungUp = true;
+      },
+      finish: () => finish(),
+      leaked: () => SIGNALS.filter((signal, i) => process.listenerCount(signal) !== listeners[i]),
+    };
+  }
+
+  it("a signal mid-refresh restores the terminal but exits only once the refresh lands", async (t) => {
+    // Killing the process while the token request is in flight can drop the
+    // reply carrying the rotated refresh token, after the old one is dead.
+    const ui = await signalTui(t);
+    ui.stdin.emit("data", "f");
+    await tick();
+
+    process.emit("SIGTERM", "SIGTERM");
+    await ui.started;
+    assert.deepEqual(ui.exits, []);
+    assert.match(ui.writes.join(""), /\u001b\[\?1049l[^]*finishing the current action/);
+
+    ui.finish();
+    await tick();
+    assert.deepEqual(ui.exits, [143]);
+    assert.deepEqual(ui.leaked(), []);
+  });
+
+  it("closing the terminal mid-refresh still waits for the refresh", async (t) => {
+    // Observed on a real pty: the restore write fails with EIO, and SIGHUP
+    // arrives twice, so neither may end the process early.
+    const ui = await signalTui(t);
+    ui.stdin.emit("data", "f");
+    await tick();
+
+    ui.hangUp();
+    process.emit("SIGHUP", "SIGHUP");
+    process.emit("SIGHUP", "SIGHUP");
+    await tick();
+    assert.deepEqual(ui.exits, []);
+
+    ui.finish();
+    await tick();
+    assert.deepEqual(ui.exits, [143]);
+    assert.deepEqual(ui.leaked(), []);
+  });
+
+  it("a second signal exits at once, so the user can always get out", async (t) => {
+    const ui = await signalTui(t);
+    ui.stdin.emit("data", "f");
+    await tick();
+
+    process.emit("SIGTERM", "SIGTERM");
+    process.emit("SIGINT", "SIGINT");
+    assert.deepEqual(ui.exits, [130]);
+
+    ui.finish();
+    await tick();
+    assert.deepEqual(ui.leaked(), []);
+  });
+
+  it("gives up waiting on a refresh that never settles after 2 minutes", async (t) => {
+    const ui = await signalTui(t);
+    ui.stdin.emit("data", "f");
+    await tick();
+
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    process.emit("SIGTERM", "SIGTERM");
+    t.mock.timers.tick(119_999);
+    assert.deepEqual(ui.exits, []);
+    t.mock.timers.tick(1);
+    assert.deepEqual(ui.exits, [143]);
+
+    ui.finish();
+    await tick();
+  });
+
+  it("exits at once with no action in flight, and q leaves no signal handlers behind", async (t) => {
+    const idle = await signalTui(t);
+    process.emit("SIGTERM", "SIGTERM");
+    await idle.started;
+    assert.deepEqual(idle.exits, [143]);
+    assert.deepEqual(idle.leaked(), []);
+
+    const quit = await signalTui(t);
+    quit.stdin.emit("data", "q");
+    await quit.started;
+    assert.deepEqual(quit.leaked(), []);
+  });
+});

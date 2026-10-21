@@ -172,7 +172,7 @@ export async function lookupEmail(accessToken: string): Promise<string | undefin
 }
 
 /** Same person, whatever their tokens: both copies' refresh tokens diverge after either refreshes. */
-function findByEmail(accounts: AccountRecord[], email: string | undefined): AccountRecord | undefined {
+export function findByEmail(accounts: AccountRecord[], email: string | undefined): AccountRecord | undefined {
   if (!email) return undefined;
   const wanted = email.toLowerCase();
   return accounts.find((a) => a.email?.toLowerCase() === wanted);

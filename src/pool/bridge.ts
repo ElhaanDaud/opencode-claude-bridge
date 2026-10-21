@@ -27,7 +27,7 @@ export function createPool(
     onAccountDisabled: hooks.onAccountDisabled,
     refreshFn: (refreshToken) => refreshTokens(refreshToken),
     mirrorFn: async (tokens: PoolOAuthTokens) => {
-      await client.auth.set({
+      const result = await client.auth.set({
         path: { id: "anthropic" },
         body: {
           type: "oauth",
@@ -36,6 +36,10 @@ export function createPool(
           expires: tokens.expires,
         },
       });
+      // The SDK resolves an HTTP error instead of throwing it; the manager
+      // must not take a failed write for a mirrored one.
+      const error = (result as { error?: unknown } | null | undefined)?.error;
+      if (error) throw new Error(`auth.set failed: ${JSON.stringify(error)}`);
     },
   });
 }

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
-import { hostname, userInfo } from "node:os";
+import { homedir, hostname, userInfo } from "node:os";
 import { join } from "node:path";
 import {
   createAuthorizationRequest,
@@ -53,6 +53,7 @@ import type { RotationDecision } from "./pool/types.js";
 
 type AuthType = {
   type: string;
+  key?: string;
   access?: string;
   refresh?: string;
   expires?: number;
@@ -466,6 +467,32 @@ function buildAuthFailureResponse(detail: string): Response {
   });
 }
 
+/** What the loader exports as ANTHROPIC_API_KEY in OAuth mode; never a real key. */
+const OAUTH_PLACEHOLDER = "oauth-placeholder";
+
+/**
+ * The API key in a stored credential: OpenCode's own `api` login, or the
+ * legacy `apikey` one this plugin used to write.
+ */
+function storedApiKey(auth: AuthType | undefined): string | undefined {
+  const key = auth?.type === "api" ? auth.key : auth?.type === "apikey" ? auth.access : undefined;
+  return key && key !== OAUTH_PLACEHOLDER ? key : undefined;
+}
+
+/**
+ * OpenCode 1's stored anthropic credential, read from where OpenCode reads it.
+ * Plugin init runs before OpenCode hands the loader any credential, and the
+ * SDK client can only write one.
+ */
+function readStoredAuth(): AuthType | undefined {
+  const file = join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode", "auth.json");
+  try {
+    return JSON.parse(process.env.OPENCODE_AUTH_CONTENT || readFileSync(file, "utf8")).anthropic;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Persist fresh tokens to OpenCode's auth store. */
 async function storeAuth(
   client: PluginClient,
@@ -487,9 +514,11 @@ type Tokens = { access: string; refresh: string; expires: number };
 // Single-account refresh state, shared by every request. Refresh tokens are
 // single-use, so concurrent refreshes share one call, and the newest tokens are
 // kept here: after a failed save, getAuth() still returns the spent one.
+// An access token Anthropic answered 401 to is never handed out again.
 let refreshInFlight: Promise<Tokens | null> | null = null;
 let latestTokens: Tokens | null = null;
 const spentRefreshTokens = new Set<string>();
+const rejectedAccessTokens = new Set<string>();
 
 /** Swap in this process's newest tokens if `auth` still holds a refresh token they replaced. */
 function adoptLatestTokens(auth: AuthType): boolean {
@@ -506,9 +535,14 @@ async function refreshAuth(
   client: PluginClient,
 ): Promise<string | null> {
   // Another request already refreshed past this request's tokens.
-  if (adoptLatestTokens(auth) && auth.expires! > Date.now() + 60_000) return auth.access!;
-  refreshInFlight ??= refreshAuthLayers(auth, client).finally(() => { refreshInFlight = null; });
-  const fresh = await refreshInFlight;
+  if (adoptLatestTokens(auth) && auth.expires! > Date.now() + 60_000 && !rejectedAccessTokens.has(auth.access!)) {
+    return auth.access!;
+  }
+  const shared = () => (refreshInFlight ??= refreshAuthLayers(auth, client).finally(() => { refreshInFlight = null; }));
+  let fresh = await shared();
+  // A refresh begun before the 401 may hand back the rejected token; any
+  // refresh begun since skips it.
+  if (fresh && rejectedAccessTokens.has(fresh.access)) fresh = await shared();
   if (!fresh) return null;
   auth.access = fresh.access;
   auth.refresh = fresh.refresh;
@@ -532,11 +566,12 @@ async function refreshAuthLayers(
   };
 
   // Layer 1: Claude CLI keychain, but only if the access token is already
-  // valid. Expired keychain refresh tokens are often stale after re-login, so
-  // do not try them before OpenCode's own stored OAuth refresh token.
+  // valid and not rejected. Expired keychain refresh tokens are often stale
+  // after re-login, so do not try them before OpenCode's own stored OAuth
+  // refresh token.
   try {
     const kt = getClaudeTokens();
-    if (kt && kt.expires > Date.now() + 60_000) fresh = kt;
+    if (kt && kt.expires > Date.now() + 60_000 && !rejectedAccessTokens.has(kt.access)) fresh = kt;
   } catch (err) {
     errors.push(String(err));
   }
@@ -1460,9 +1495,17 @@ export async function startPool(client: PoolClient, toast: Toaster): Promise<Sta
 // ── Plugin ─────────────────────────────────────────────────────────
 
 const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
-  // Save and clear ANTHROPIC_API_KEY so SDK doesn't bypass our fetch.
-  // Restored if OAuth isn't active (API key providers still work).
-  const savedApiKey = process.env.ANTHROPIC_API_KEY;
+  // Save ANTHROPIC_API_KEY so it can be restored if OAuth isn't active (API
+  // key providers still work). A plugin re-created in this process sees the
+  // placeholder an earlier loader exported, which is not the user's key.
+  const envApiKey = process.env.ANTHROPIC_API_KEY;
+  const savedApiKey = envApiKey === OAUTH_PLACEHOLDER ? undefined : envApiKey;
+  const restoreEnvApiKey = () => {
+    if (savedApiKey) process.env.ANTHROPIC_API_KEY = savedApiKey;
+    else if (process.env.ANTHROPIC_API_KEY === OAUTH_PLACEHOLDER) delete process.env.ANTHROPIC_API_KEY;
+  };
+  // Set by the loader: requests on an API key go out as OpenCode sends them.
+  let apiKeyActive = false;
   const sessionId = SESSION_ID || randomUUID();
   const deviceId = getStableDeviceId();
 
@@ -1478,12 +1521,16 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   // keychain: that keychain holds whichever account `claude login` last used,
   // so seeding from it would overwrite the active account on every startup and
   // silently undo rotation.
+  //
+  // A stored API key is left alone: seeding would replace it with OAuth tokens.
   try {
-    if (poolActive) {
-      await pool.acquire();
-    } else {
-      const tokens = getClaudeTokens();
-      if (tokens) await storeAuth(client, tokens);
+    if (!storedApiKey(readStoredAuth())) {
+      if (poolActive) {
+        await pool.acquire();
+      } else {
+        const tokens = getClaudeTokens();
+        if (tokens) await storeAuth(client, tokens);
+      }
     }
   } catch {}
 
@@ -1492,7 +1539,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
       input: { model?: { providerID: string } },
       output: { system: string[] },
     ) => {
-      if (input.model?.providerID !== "anthropic") return;
+      if (input.model?.providerID !== "anthropic" || apiKeyActive) return;
       if (output.system.some((s) => s.includes(CLAUDE_PREFIX))) return;
       if (output.system.length > 0) {
         output.system[0] = `${CLAUDE_PREFIX}\n\n${output.system[0]}`;
@@ -1518,6 +1565,16 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
         let auth = await getAuth();
 
+        // API key mode: OpenCode sends the key as x-api-key itself, so there is
+        // no fetch wrapper and no OAuth rewrite. Checked before the bootstrap
+        // below, which would replace the key with OAuth tokens.
+        const apiKey = storedApiKey(auth);
+        apiKeyActive = apiKey !== undefined;
+        if (apiKey) {
+          restoreEnvApiKey();
+          return { apiKey };
+        }
+
         // Auto-bootstrap if no OAuth tokens are stored. With the pool active
         // this seeds from the pool, not the Claude CLI keychain, for the same
         // anti-clobber reason as the init path above.
@@ -1536,21 +1593,15 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
           } catch {}
         }
 
-        // API key mode — set the key in env and let the SDK handle everything
-        if (auth.type === "apikey" && auth.access) {
-          process.env.ANTHROPIC_API_KEY = auth.access;
-          return {};
-        }
-
         if (auth.type !== "oauth") {
           // Not configured — restore env API key if present so SDK can use it
-          if (savedApiKey) process.env.ANTHROPIC_API_KEY = savedApiKey;
+          restoreEnvApiKey();
           return {};
         }
 
         // OAuth active — set a placeholder so the SDK doesn't error on missing key.
         // Our fetch wrapper sets the real Authorization: Bearer header and removes x-api-key.
-        process.env.ANTHROPIC_API_KEY = "oauth-placeholder";
+        process.env.ANTHROPIC_API_KEY = OAUTH_PLACEHOLDER;
 
         return {
           // OpenCode 1.4.0 now rejects Anthropic provider config when both an
@@ -1640,6 +1691,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             if (!usePool && response.status === 401) {
               console.error("[opencode-claude-bridge] 401 from Anthropic; refreshing token and retrying once");
+              rejectedAccessTokens.add(accessToken);
               let freshToken: string | null = null;
               try {
                 freshToken = await refreshAuth(auth, client);
@@ -1833,37 +1885,10 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
           },
         },
         {
+          // OpenCode prompts for the key itself (CLI and TUI) and stores it as
+          // an `api` credential, which the loader hands back untouched.
           label: "Claude API Key",
-          type: "oauth" as const,
-          authorize: async () => {
-            // Auto-detect from environment
-            const envKey = process.env.ANTHROPIC_API_KEY || savedApiKey;
-            if (envKey) {
-              await client.auth.set({
-                path: { id: "anthropic" },
-                body: { type: "apikey", access: envKey, expires: Date.now() + 365 * 24 * 60 * 60 * 1000 },
-              });
-              return {
-                instructions: "✓ API key found in environment — press Esc, then restart OpenCode if Anthropic models aren't visible",
-                method: "code" as const,
-                callback: async () => ({ type: "success" as const, access: envKey, refresh: "", expires: Date.now() + 365 * 24 * 60 * 60 * 1000 }),
-              };
-            }
-            // Prompt user to paste key
-            return {
-              instructions: "Paste your Anthropic API key (sk-ant-...):",
-              method: "code" as const,
-              callback: async (key: string) => {
-                const k = key.trim();
-                if (!k) return { type: "failed" as const };
-                await client.auth.set({
-                  path: { id: "anthropic" },
-                  body: { type: "apikey", access: k, expires: Date.now() + 365 * 24 * 60 * 60 * 1000 },
-                });
-                return { type: "success" as const, access: k, refresh: "", expires: Date.now() + 365 * 24 * 60 * 60 * 1000 };
-              },
-            };
-          },
+          type: "api" as const,
         },
       ],
     },

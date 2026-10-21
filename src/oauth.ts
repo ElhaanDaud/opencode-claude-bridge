@@ -1,6 +1,6 @@
 import { randomBytes, createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { RETRYABLE_STATUSES, getTokenRetryDelayMs } from "./retry.js";
 import {
   CLIENT_ID,
@@ -42,12 +42,21 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** How long one curl run may take before it is killed. */
+const CURL_TIMEOUT_MS = 30_000;
+/** Largest reply read from curl, per output stream. */
+const CURL_MAX_OUTPUT_BYTES = 1024 * 1024;
+
 // Payload (tokens, PKCE verifier) goes over stdin: argv is visible to `ps`.
+// --max-time is a backstop to runCurl's own timeout: curl runs in its own
+// process group, so it outlives a parent that dies mid-request.
 export function buildTokenCurlArgs(): string[] {
   return [
     "-sS",
     "-w",
     "\n__HTTP_STATUS__%{http_code}",
+    "--max-time",
+    String(CURL_TIMEOUT_MS / 1000 + 5),
     "-X",
     "POST",
     TOKEN_URL,
@@ -60,28 +69,86 @@ export function buildTokenCurlArgs(): string[] {
   ];
 }
 
-// execFile's error message embeds the command line; never rethrow it raw.
+// A child-process error can carry the command line; never rethrow it raw.
 function describeCurlFailure(err: unknown): string {
   const e = err as { code?: string | number; killed?: boolean; signal?: string | null; stderr?: unknown };
   if (e.code === "ENOENT") return "curl is not installed or not on PATH";
-  if (e.killed || e.signal === "SIGTERM") return "request timed out";
+  if (e.killed) return "request timed out";
+  if (e.signal) return `curl was killed by ${e.signal}`;
   const stderr = typeof e.stderr === "string" ? e.stderr.trim() : "";
   if (typeof e.code === "number") return `curl exited ${e.code}${stderr ? `: ${stderr}` : ""}`;
   return typeof e.code === "string" ? e.code : "unknown curl failure";
 }
 
+// curl exits that end the attempt before any of the request is sent: the host
+// did not resolve (6), the connection failed (7), the TLS handshake failed (35).
+// Anything else, including a timeout (28, or runCurl killing curl), an empty
+// reply (52) or a send or receive error (55, 56), may come after the server
+// has read the request and spent the single-use refresh token or code.
+const UNSENT_CURL_EXITS = new Set([6, 7, 35]);
+
+/** True only when curl provably never sent the request, so resending it cannot spend a token twice. */
+export function curlFailedBeforeSending(err: unknown): boolean {
+  const e = err as { code?: unknown; killed?: boolean };
+  return !e.killed && typeof e.code === "number" && UNSENT_CURL_EXITS.has(e.code);
+}
+
+/** How long a payload whose send may have reached the server is held back from every caller. */
+export const UNCERTAIN_SEND_HOLD_MS = 10_000;
+
+// Payloads whose last send may have reached the server, with the failure it
+// got. Another caller holding the same token (V1 sends a title request beside
+// the prompt) gets that failure instead of spending the token again. After the
+// hold it may be sent once more: the server may never have read it.
+const uncertainSends = new Map<string, { message: string; until: number }>();
+
 // Async on purpose: a synchronous child process blocks the event loop, which
 // stalls every stream in the long-lived opencode server for the whole refresh.
+// `detached` puts curl in its own process group: closing the terminal (SIGHUP)
+// or Ctrl-C (SIGINT) signals the terminal's whole foreground group, and a curl
+// killed after sending loses the reply carrying the rotated refresh token,
+// even when its caller (the pool dashboard) survives the signal to wait for it.
+// execFile ignores `detached`, so spawn is used and its timeout rebuilt here.
 function runCurl(payload: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = execFile(
-      "curl",
-      buildTokenCurlArgs(),
-      { timeout: 30000, encoding: "utf8", maxBuffer: 1024 * 1024 },
-      (error, stdout, stderr) => (error ? reject(Object.assign(error, { stderr })) : resolve(stdout)),
+    const child = spawn("curl", buildTokenCurlArgs(), { detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    // Why runCurl killed curl. Neither is an exit curlFailedBeforeSending
+    // trusts, so the request counts as possibly sent and is never resent.
+    let failure: Error | undefined;
+    const stop = (err: Error) => {
+      if (failure) return;
+      failure = err;
+      child.kill();
+    };
+    const timer = setTimeout(
+      () => stop(Object.assign(new Error("curl timed out"), { killed: true })),
+      CURL_TIMEOUT_MS,
     );
+    // ENOENT when curl is missing; 'close' follows, and the promise is already settled.
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (failure) reject(failure);
+      else if (code === 0) resolve(Buffer.concat(stdout).toString("utf8"));
+      else reject(Object.assign(new Error("curl failed"), { code, signal, stderr: Buffer.concat(stderr).toString("utf8") }));
+    });
+    const collect = (stream: NodeJS.ReadableStream | null, chunks: Buffer[]) => {
+      let size = 0;
+      stream?.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size <= CURL_MAX_OUTPUT_BYTES) chunks.push(chunk);
+        else stop(Object.assign(new Error("curl output too large"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }));
+      });
+    };
+    collect(child.stdout, stdout);
+    collect(child.stderr, stderr);
     // curl can exit (DNS/TLS failure) before reading stdin; an unhandled EPIPE
-    // would crash the whole opencode process. The exit callback reports it.
+    // would crash the whole opencode process. The close handler reports it.
     child.stdin?.on("error", () => {});
     child.stdin?.end(payload);
   });
@@ -90,12 +157,21 @@ function runCurl(payload: string): Promise<string> {
 /**
  * curl-based token exchange to avoid Bun/runtime fetch injecting
  * forbidden headers (Origin, Referer, Sec-Fetch-*) that trigger 429s.
+ *
+ * Refresh tokens and authorization codes are single-use, so a request is sent
+ * again only after the server answered 429/529 or curl never sent it, and one
+ * that may have reached the server is held back from other callers too.
  */
 async function curlPost(
   body: Record<string, string>,
   retries = 3,
+  wait = sleep,
 ): Promise<{ status: number; body: string }> {
   const payload = JSON.stringify(body);
+  const now = Date.now();
+  for (const [key, { until }] of uncertainSends) if (until <= now) uncertainSends.delete(key);
+  const held = uncertainSends.get(payload);
+  if (held) throw new Error(held.message);
 
   for (let attempt = 0; ; attempt++) {
     let retryDelayMs: number;
@@ -118,12 +194,15 @@ async function curlPost(
         `[opencode-oauth] Token endpoint ${status} (attempt ${attempt + 1}/${retries}), retrying...`,
       );
     } catch (err) {
-      if (attempt === retries - 1) {
-        throw new Error(`Token endpoint unreachable: ${describeCurlFailure(err)}`);
+      const unsent = curlFailedBeforeSending(err);
+      if (attempt === retries - 1 || !unsent) {
+        const message = `Token endpoint unreachable: ${describeCurlFailure(err)}`;
+        if (!unsent) uncertainSends.set(payload, { message, until: Date.now() + UNCERTAIN_SEND_HOLD_MS });
+        throw new Error(message);
       }
       retryDelayMs = 1000 * Math.pow(2, attempt) + Math.random() * 1000;
     }
-    await sleep(retryDelayMs);
+    await wait(retryDelayMs);
   }
 }
 
@@ -392,12 +471,16 @@ export async function exchangeCodeForTokens(
   return parseTokenResponse(status, body, "Token exchange");
 }
 
-/** `retries: 1` sends the single-use refresh token once: a retry after a request that reached the server can spend it twice. */
-export async function refreshTokens(refreshToken: string, retries?: number): Promise<OAuthTokens> {
+/** `retries` caps the attempts; curlPost never resends a request that may have spent the token. */
+export async function refreshTokens(
+  refreshToken: string,
+  retries?: number,
+  wait?: (ms: number) => Promise<void>,
+): Promise<OAuthTokens> {
   const { status, body } = await curlPost({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: CLIENT_ID,
-  }, retries);
+  }, retries, wait);
   return parseTokenResponse(status, body, "Token refresh");
 }
