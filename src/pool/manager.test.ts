@@ -136,6 +136,34 @@ describe("rotation manager activation", () => {
     const seeded = harness(t, [record("alice")]);
     assert.equal(await seeded.manager.isActive(), true);
   });
+
+  it("stays active and registers accounts whose credentials cannot be read", async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pool-manager-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    // A locked keychain still lists its items but refuses to read them.
+    const locked: SecretBackend = {
+      ...memoryBackend({ alice: JSON.stringify(record("alice")) }),
+      async get(label) {
+        throw new Error(`Failed to read keychain account "${label}"`);
+      },
+    };
+    const state = createRotationStateStore({ path: path.join(root, "state.json"), lockPollMs: 1 });
+    const manager = createRotationManager({
+      accounts: createAccountStore(locked),
+      state,
+      clock: () => NOW,
+      journalPath: path.join(root, "journal.json"),
+      refreshFn: () => {
+        throw new Error("unused");
+      },
+      mirrorFn: async () => {},
+    });
+
+    assert.equal(await manager.isActive(), true);
+    assert.deepEqual(await manager.listLabels(), ["alice"]);
+    await manager.sync();
+    assert.ok(state.load().accounts.alice);
+  });
 });
 
 describe("rotation manager token acquisition", () => {
@@ -164,6 +192,36 @@ describe("rotation manager token acquisition", () => {
     // Non-token fields must survive a refresh.
     assert.equal(stored?.subscriptionType, "max");
     assert.equal(h.mirrored.at(-1)?.access, "access-alice-v2");
+  });
+
+  it("still returns the token when mirroring into auth.json fails", async (t) => {
+    const h = harness(t, [record("alice")]);
+    const manager = createRotationManager({
+      accounts: h.accounts,
+      state: h.state,
+      clock: () => NOW,
+      journalPath: h.journalPath,
+      refreshFn: () => {
+        throw new Error("must not refresh a fresh token");
+      },
+      mirrorFn: async (tokens) => {
+        throw new Error(`auth.set boom for ${tokens.access}`);
+      },
+    });
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => errors.push(args.join(" "));
+    t.after(() => {
+      console.error = originalError;
+    });
+
+    const result = await manager.acquire();
+
+    // auth.json is only a copy of the pool; failing to write it must not fail the request.
+    assert.equal(result.kind === "ok" && result.accessToken, "access-alice");
+    assert.equal(h.state.load().activeLabel, "alice");
+    assert.ok(errors.some((e) => e.includes("auth.json")), errors.join("\n"));
+    assert.ok(!errors.some((e) => e.includes("access-alice")), errors.join("\n"));
   });
 
   it("collapses concurrent refreshes of one account into a single call", async (t) => {
@@ -202,6 +260,20 @@ describe("rotation manager token acquisition", () => {
     await h.manager.acquire();
 
     assert.deepEqual(order, ["journal-first"]);
+  });
+
+  it("commits the new tokens even when the journal cannot be written", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    // A directory in the journal's place makes the final rename fail.
+    fs.mkdirSync(h.journalPath);
+
+    const tokens = await h.manager.refreshLabel("alice");
+
+    assert.equal(tokens.refresh, "refresh-alice-v2");
+    assert.deepEqual(h.refreshCalls, ["refresh-alice"]);
+    assert.equal((await h.accounts.getAccount("alice"))?.oauth.refresh, "refresh-alice-v2");
+    const leftovers = fs.readdirSync(path.dirname(h.journalPath)).filter((f) => f.endsWith(".tmp"));
+    assert.deepEqual(leftovers, []);
   });
 });
 
@@ -326,6 +398,7 @@ describe("rotation manager journal replay", () => {
   it("commits a journal left behind by a crashed process", async (t) => {
     const h = harness(t, [record("alice")]);
     fs.mkdirSync(path.dirname(h.journalPath), { recursive: true });
+    // No `replaces`, as journaled by versions before it existed: still replayed.
     fs.writeFileSync(
       h.journalPath,
       JSON.stringify({
@@ -389,22 +462,62 @@ describe("rotation manager journal replay", () => {
     assert.deepEqual(h.refreshCalls, []);
     assert.equal(fs.existsSync(h.journalPath), false);
   });
+
+  it("sets aside a journal for an account that is no longer enrolled", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    writePendingJournal(h.journalPath, "removed");
+
+    const tokens = await h.manager.refreshLabel("alice");
+
+    assert.equal(tokens.refresh, "refresh-alice-v2");
+    assert.equal(fs.existsSync(h.journalPath), false);
+    const aside = setAsideJournals(h.journalPath);
+    assert.equal(aside.length, 1);
+    assert.equal(JSON.parse(fs.readFileSync(aside[0]!, "utf8")).tokens.refresh, "recovered-refresh");
+  });
+
+  it("sets aside a crash journal instead of overwriting a re-enrolled account", async (t) => {
+    const h = harness(t, [record("alice", { expires: NOW - 1 })]);
+    const originalUpdate = h.accounts.updateTokens.bind(h.accounts);
+    h.accounts.updateTokens = async () => {
+      throw new Error("crashed before commit");
+    };
+    await assert.rejects(h.manager.refreshLabel("alice"), /crashed before commit/);
+    h.accounts.updateTokens = originalUpdate;
+    // Re-login and re-enroll before anything replays the journal.
+    await h.accounts.putAccount(record("alice", { access: "access-new", refresh: "refresh-new" }));
+
+    assert.equal(await h.manager.replayJournal(), false);
+
+    assert.equal((await h.accounts.getAccount("alice"))?.oauth.refresh, "refresh-new");
+    assert.equal(fs.existsSync(h.journalPath), false);
+    assert.equal(setAsideJournals(h.journalPath).length, 1);
+  });
 });
 
-function writePendingJournal(journalPath: string): void {
+function writePendingJournal(journalPath: string, label = "alice"): void {
   fs.mkdirSync(path.dirname(journalPath), { recursive: true });
   fs.writeFileSync(
     journalPath,
     JSON.stringify({
-      label: "alice",
+      label,
       tokens: {
         access: "recovered-access",
         refresh: "recovered-refresh",
         expires: NOW + 3_600_000,
       },
       writtenAt: NOW - 5_000,
+      replaces: `refresh-${label}`,
     }),
   );
+}
+
+function setAsideJournals(journalPath: string): string[] {
+  const dir = path.dirname(journalPath);
+  return fs
+    .readdirSync(dir)
+    .filter((f) => f.startsWith(`${path.basename(journalPath)}.`) && f.endsWith(".stale"))
+    .map((f) => path.join(dir, f));
 }
 
 describe("rotation manager rotation", () => {
@@ -510,7 +623,7 @@ describe("rotation manager rotation", () => {
       source: "retry-after",
     });
 
-    await h.manager.markSuccess("alice");
+    await h.manager.markSuccess("alice", NOW);
 
     assert.equal(h.state.load().accounts.alice?.cooldownUntil, null);
     assert.equal(h.state.load().accounts.alice?.failureCount, 0);

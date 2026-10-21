@@ -3,30 +3,41 @@
 # Usage: ./scripts/intercept-claude.sh [model]
 #
 # Starts a local proxy, runs Claude CLI through it, and saves the full request
-# to /tmp/claude-intercept-{headers,body}.json for analysis.
+# to a private /tmp/claude-intercept.XXXXXX/N-{headers,body}.json for analysis.
+# Credential headers are redacted in the saved files.
+
+set -euo pipefail
 
 MODEL="${1:-claude-sonnet-4-6}"
-PORT=18899
+
+umask 077
+OUT=$(mktemp -d /tmp/claude-intercept.XXXXXX)
+PROXY_PID=
+trap '[[ -z $PROXY_PID ]] || kill "$PROXY_PID" 2>/dev/null || true' EXIT
+trap 'exit 130' INT TERM
 
 echo "=== Claude Code Network Interceptor ==="
 echo "Model: $MODEL"
-echo "Proxy: localhost:$PORT"
+echo "Output: $OUT"
 echo ""
 
-# Start interceptor proxy
-node -e "
-const http = require('http'), https = require('https'), fs = require('fs');
+# Start interceptor proxy on a free loopback port; it writes the port to $OUT/port
+INTERCEPT_DIR="$OUT" node -e "
+const http = require('http'), https = require('https'), fs = require('fs'), path = require('path');
+const dir = process.env.INTERCEPT_DIR;
 let count = 0;
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', c => body += c);
   req.on('end', () => {
     count++;
-    const file = '/tmp/claude-intercept-' + count;
+    const file = path.join(dir, String(count));
+    const headers = { ...req.headers };
+    for (const k of ['authorization', 'x-api-key']) if (headers[k]) headers[k] = '<redacted>';
     fs.writeFileSync(file + '-headers.json', JSON.stringify({
       method: req.method,
       url: req.url,
-      headers: req.headers
+      headers
     }, null, 2));
     fs.writeFileSync(file + '-body.json', body);
 
@@ -66,28 +77,33 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen($PORT, () => {
-  console.error('Proxy ready on $PORT');
+server.listen(0, '127.0.0.1', () => {
+  const port = server.address().port;
+  fs.writeFileSync(path.join(dir, 'port'), String(port));
+  console.error('Proxy ready on 127.0.0.1:' + port);
   console.error('');
 });
 
 setTimeout(() => { server.close(); process.exit(0); }, 60000);
 " &
 PROXY_PID=$!
-sleep 1
+for _ in {1..50}; do
+  [[ -s "$OUT/port" ]] && break
+  sleep 0.1
+done
+[[ -s "$OUT/port" ]] || { echo "Proxy failed to start" >&2; exit 1; }
+PORT=$(<"$OUT/port")
+rm "$OUT/port"
 
 # Run Claude CLI through proxy (force OAuth by clearing API key)
 echo "Running: claude -p 'say hi' --model $MODEL"
 echo ""
-ANTHROPIC_API_KEY= ANTHROPIC_BASE_URL=http://localhost:$PORT \
-  claude -p "say hi" --model "$MODEL" 2>/dev/null
-
-kill $PROXY_PID 2>/dev/null
-wait $PROXY_PID 2>/dev/null
+ANTHROPIC_API_KEY= ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT \
+  claude -p "say hi" --model "$MODEL" 2>/dev/null || true
 
 echo ""
-echo "=== Saved to /tmp/claude-intercept-*-{headers,body}.json ==="
+echo "=== Saved to $OUT/*-{headers,body}.json ==="
 echo ""
 echo "Inspect with:"
-echo "  cat /tmp/claude-intercept-1-headers.json | python3 -m json.tool"
-echo "  python3 -c \"import json; d=json.load(open('/tmp/claude-intercept-1-body.json')); print(sorted(d.keys()))\""
+echo "  cat $OUT/1-headers.json | python3 -m json.tool"
+echo "  python3 -c \"import json; d=json.load(open('$OUT/1-body.json')); print(sorted(d.keys()))\""

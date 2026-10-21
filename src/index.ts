@@ -25,6 +25,7 @@ import {
   DEFAULT_EFFORT,
   CLEAR_THINKING_TYPE,
   SESSION_ID,
+  PLUGIN_ID,
 } from "./constants.js";
 import {
   getClaudeTools,
@@ -36,9 +37,9 @@ import {
 } from "./claude-tools.js";
 import type { ToolDefinition } from "./claude-tools.js";
 import { translateSseStream } from "./stream.js";
-import { MAX_RESPONSE_RETRIES, RETRYABLE_STATUSES, getResponseRetryDelayMs } from "./retry.js";
+import { MAX_RESPONSE_RETRIES, MAX_RETRY_DELAY_MS, RETRYABLE_STATUSES, getResponseRetryDelayMs } from "./retry.js";
 import { buildPoolBusyResponse, buildPoolExhaustedResponse, createPool } from "./pool/bridge.js";
-import { LockTimeoutError } from "./pool/rotation-state.js";
+import { LockTimeoutError, createRotationStateStore, defaultLockPath, defaultStatePath } from "./pool/rotation-state.js";
 import { truncate } from "./pool/dashboard.js";
 import { autoEnrollIfNew, labelSharingClaudeCliLogin, sharedLoginWarning } from "./pool/enroll.js";
 import { createToaster } from "./pool/notify.js";
@@ -92,18 +93,23 @@ const OUTBOUND_TOOL_NAME_MAP: Record<string, string> = {
   webfetch: "WebFetch",
   todowrite: "TodoWrite",
   skill: "Skill",
-  mcp_bash: "Bash",
-  mcp_read: "Read",
-  mcp_glob: "Glob",
-  mcp_grep: "Grep",
-  mcp_edit: "Edit",
-  mcp_write: "Write",
-  mcp_task: "Agent",
-  mcp_webfetch: "WebFetch",
-  mcp_todowrite: "TodoWrite",
-  mcp_skill: "Skill",
   question: "AskUserQuestion",
-  mcp_question: "AskUserQuestion",
+  plan_enter: "EnterPlanMode",
+  plan_exit: "ExitPlanMode",
+};
+
+const ACTIVE_TOOL_SCHEMA_NAME_MAP: Record<string, string> = {
+  bash: "Bash",
+  read: "Read",
+  glob: "Glob",
+  grep: "Grep",
+  edit: "Edit",
+  write: "Write",
+  task: "Agent",
+  webfetch: "WebFetch",
+  todowrite: "TodoWrite",
+  skill: "Skill",
+  question: "AskUserQuestion",
   plan_enter: "EnterPlanMode",
   plan_exit: "ExitPlanMode",
 };
@@ -290,6 +296,12 @@ export function supportsAdaptiveThinking(model: unknown): boolean {
 
 const EFFORTS_ABOVE_HIGH = new Set(["xhigh", "max"]);
 
+// Sonnet 5.5 can't turn thinking off: it rejects {type:"disabled"}, and "between_tools"
+// is its lowest setting.
+function canDisableThinking(model: unknown): boolean {
+  return !(typeof model === "string" && model.startsWith("claude-sonnet-5-5"));
+}
+
 // Sonnet 5.5 rejects thinking:{type:"disabled"} and {type:"enabled"} (budget_tokens; omo
 // builds it for metis, momus and sisyphus-junior) with a 400. "enabled" becomes adaptive;
 // "between_tools" is its lowest thinking setting, accepts no other thinking field, and 400s
@@ -355,48 +367,77 @@ export function shouldInjectClaudeTools(input: {
   return Array.isArray(input.tools) && input.tools.length > 0;
 }
 
-export type OutboundTool = ToolDefinition | { name: string;[key: string]: unknown };
+function getToolName(tool: unknown): string | undefined {
+  if (!tool || typeof tool !== "object") return undefined;
+  const name = (tool as { name?: unknown }).name;
+  return typeof name === "string" ? name : undefined;
+}
 
-/**
- * Tools with a Claude Code counterpart are swapped for the wire-captured Claude
- * schema; tools without one (plugin/MCP, e.g. DCP's `compress`) keep their own
- * schema rather than being dropped.
- */
+function getToolInputSchema(tool: unknown): Record<string, unknown> | undefined {
+  if (!tool || typeof tool !== "object") return undefined;
+  const inputSchema = (tool as { input_schema?: unknown }).input_schema;
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return undefined;
+  return inputSchema as Record<string, unknown>;
+}
+
 export function getClaudeToolsForActiveOpenCodeTools(
   tools: unknown,
-): OutboundTool[] {
+): ToolDefinition[] {
   if (!Array.isArray(tools)) return [];
-
-  const claudeCatalog = getClaudeTools();
-  const claudeCatalogNames = new Set(claudeCatalog.map((tool) => tool.name));
-
-  const matchedClaudeNames = new Set<string>();
-  const unmatchedByName = new Map<string, OutboundTool>();
+  const claudeToolsByName = new Map(getClaudeTools().map((tool) => [tool.name, tool]));
+  const selectedToolsByName = new Map<string, ToolDefinition>();
 
   for (const tool of tools) {
-    if (!tool || typeof tool !== "object") continue;
-    const name = (tool as { name?: unknown }).name;
-    if (typeof name !== "string") continue;
+    const name = getToolName(tool);
+    if (!name) continue;
 
-    const claudeName = OUTBOUND_TOOL_NAME_MAP[name] || name;
-    if (claudeCatalogNames.has(claudeName)) {
-      matchedClaudeNames.add(claudeName);
-    } else if (!unmatchedByName.has(name)) {
-      unmatchedByName.set(name, tool as OutboundTool);
+    const claudeName = ACTIVE_TOOL_SCHEMA_NAME_MAP[name];
+    if (claudeName) {
+      const claudeTool = claudeToolsByName.get(claudeName);
+      if (!claudeTool) continue;
+      selectedToolsByName.set(claudeName, claudeTool);
+      continue;
     }
+
+    const inputSchema = getToolInputSchema(tool);
+    if (!inputSchema) {
+      console.error(
+        `[opencode-claude-bridge] Dropping active tool "${name}" — missing or invalid input_schema`,
+      );
+      continue;
+    }
+
+    const description = (tool as { description?: unknown }).description;
+    selectedToolsByName.set(name, {
+      name,
+      description: typeof description === "string" ? description : "",
+      input_schema: inputSchema,
+    });
   }
 
-  // Ordering is deterministic to keep the serialized prefix byte-stable across
-  // turns: the bridge strips explicit cache_control and depends entirely on
-  // Anthropic's implicit prefix caching.
-  const passthrough = [...unmatchedByName.values()].sort((a, b) =>
-    a.name.localeCompare(b.name),
-  );
+  // Claude core tools first, then custom/MCP tools, each sorted: matches
+  // Claude Code's wire order and keeps the serialized prefix byte-stable, since
+  // the bridge strips cache_control and relies on implicit prefix caching.
+  const byName = (x: ToolDefinition, y: ToolDefinition) => x.name.localeCompare(y.name);
+  const selected = Array.from(selectedToolsByName.values());
+  const isCore = (tool: ToolDefinition) => claudeToolsByName.get(tool.name) === tool;
+  return [...selected.filter(isCore).sort(byName), ...selected.filter((t) => !isCore(t)).sort(byName)];
+}
 
-  return [
-    ...claudeCatalog.filter((tool) => matchedClaudeNames.has(tool.name)),
-    ...passthrough,
-  ];
+export function getInboundToolNameMapForActiveOpenCodeTools(
+  tools: unknown,
+): Record<string, string> {
+  if (!Array.isArray(tools)) return {};
+  const inboundToolNameMap: Record<string, string> = {};
+
+  for (const tool of tools) {
+    const name = getToolName(tool);
+    if (!name) continue;
+    const claudeName = ACTIVE_TOOL_SCHEMA_NAME_MAP[name];
+    if (claudeName) inboundToolNameMap[claudeName] = name;
+  }
+
+  return inboundToolNameMap;
 }
 
 const oauthProfileCache = new Map<string, Promise<OAuthProfile | null>>();
@@ -441,12 +482,45 @@ async function storeAuth(
   });
 }
 
-/** Layered token refresh: valid keychain access → stored refresh → CLI refresh token. */
+type Tokens = { access: string; refresh: string; expires: number };
+
+// Single-account refresh state, shared by every request. Refresh tokens are
+// single-use, so concurrent refreshes share one call, and the newest tokens are
+// kept here: after a failed save, getAuth() still returns the spent one.
+let refreshInFlight: Promise<Tokens | null> | null = null;
+let latestTokens: Tokens | null = null;
+const spentRefreshTokens = new Set<string>();
+
+/** Swap in this process's newest tokens if `auth` still holds a refresh token they replaced. */
+function adoptLatestTokens(auth: AuthType): boolean {
+  if (!latestTokens || !auth.refresh || !spentRefreshTokens.has(auth.refresh)) return false;
+  auth.access = latestTokens.access;
+  auth.refresh = latestTokens.refresh;
+  auth.expires = latestTokens.expires;
+  return true;
+}
+
+/** Refresh `auth` in place; concurrent callers share one refresh. */
 async function refreshAuth(
   auth: AuthType,
   client: PluginClient,
 ): Promise<string | null> {
-  type Tokens = { access: string; refresh: string; expires: number };
+  // Another request already refreshed past this request's tokens.
+  if (adoptLatestTokens(auth) && auth.expires! > Date.now() + 60_000) return auth.access!;
+  refreshInFlight ??= refreshAuthLayers(auth, client).finally(() => { refreshInFlight = null; });
+  const fresh = await refreshInFlight;
+  if (!fresh) return null;
+  auth.access = fresh.access;
+  auth.refresh = fresh.refresh;
+  auth.expires = fresh.expires;
+  return fresh.access;
+}
+
+/** Layered token refresh: valid keychain access → stored refresh → CLI refresh token. */
+async function refreshAuthLayers(
+  auth: AuthType,
+  client: PluginClient,
+): Promise<Tokens | null> {
   let fresh: Tokens | null = null;
   const errors: string[] = [];
   const attemptedRefreshTokens = new Set<string>();
@@ -487,16 +561,15 @@ async function refreshAuth(
   if (fresh) {
     // In memory first: the old refresh token is already spent, so if persisting
     // fails these are the only valid credentials this process has.
-    auth.access = fresh.access;
-    auth.refresh = fresh.refresh;
-    auth.expires = fresh.expires;
+    for (const token of attemptedRefreshTokens) spentRefreshTokens.add(token);
+    latestTokens = fresh;
     try {
       await storeAuth(client, fresh);
     } catch (err) {
       const detail = err instanceof Error ? err.message.split("\n")[0]!.slice(0, 200) : String(err);
-      console.error(`[opencode-claude-bridge] refreshed tokens could not be saved; they stay valid in memory until restart: ${detail}`);
+      console.error(`[opencode-claude-bridge] refreshed tokens could not be saved; keeping them in memory and retrying the save on the next request: ${detail}`);
     }
-    return fresh.access;
+    return fresh;
   }
 
   if (errors.length > 0) {
@@ -608,21 +681,9 @@ function deduplicatePrefix(text: string): string {
   return text;
 }
 
-function mapOutboundToolName(name: string | undefined): string | undefined {
+export function mapOutboundToolName(name: string | undefined): string | undefined {
   if (!name) return name;
   return OUTBOUND_TOOL_NAME_MAP[name] || name;
-}
-
-function maybeUnquoteText(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("\"")) return text;
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (typeof parsed === "string") return parsed;
-  } catch {
-    // Expected for non-JSON text — don't log.
-  }
-  return text;
 }
 
 const OPENCODE_CONTINUATION_NUDGE = "Continue with your tasks.";
@@ -687,18 +748,19 @@ export function mergeClaudeSystemPrompt(
   return [{ type: "text", text: billingHeader }, ...claudeBlocks, ...own];
 }
 
-function normalizeSystemBlocks(
+// "OpenCode" as a word, not inside a path, URL or name such as OhMyOpenCode or
+// /Applications/OpenCode.app. Lowercase "opencode" is left alone: in a prompt
+// it is a command, directory or package name.
+const STANDALONE_OPENCODE = /(?<![\w@./-])OpenCode(?![\w/-]|\.\w)/g;
+
+export function normalizeSystemBlocks(
   system: Array<{ type?: string; text?: string }>,
 ): Array<{ type?: string; text?: string }> {
   const normalized = system.map((item) => {
     if (item.type === "text" && item.text) {
       return {
         ...item,
-        text: deduplicatePrefix(
-          item.text
-            .replace(/OpenCode/g, "Claude Code")
-            .replace(/opencode/gi, "Claude"),
-        ),
+        text: deduplicatePrefix(item.text.replace(STANDALONE_OPENCODE, "Claude Code")),
       };
     }
     return item;
@@ -781,6 +843,11 @@ function buildBillingHeader(
   return `x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=${ccEntrypoint}; cch=${cch};`;
 }
 
+// A stalled or failing profile lookup must not hold up requests: give up after
+// a few seconds, send without metadata.user_id, and retry a minute later.
+const PROFILE_TIMEOUT_MS = 5_000;
+const PROFILE_RETRY_MS = 60_000;
+
 async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | null> {
   const cached = oauthProfileCache.get(accessToken);
   if (cached) return cached;
@@ -794,6 +861,7 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
           "user-agent": getUserAgent(),
           "anthropic-beta": OAUTH_BETA_FLAG,
         },
+        signal: AbortSignal.timeout(PROFILE_TIMEOUT_MS),
       });
       if (!response.ok) return null;
       return await response.json() as OAuthProfile;
@@ -804,7 +872,7 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
 
   oauthProfileCache.set(accessToken, pending);
   void pending.then((profile) => {
-    if (!profile) oauthProfileCache.delete(accessToken);
+    if (!profile) setTimeout(() => oauthProfileCache.delete(accessToken), PROFILE_RETRY_MS).unref();
   });
   return pending;
 }
@@ -832,6 +900,8 @@ export interface PreparedRequest {
   body: BodyInit | null | undefined;
   /** True when the bridge, not the caller, set metadata.user_id (so rotation must rebind it). */
   ownsUserId: boolean;
+  /** Claude tool name → OpenCode tool name, for translating the response stream. */
+  inboundToolNameMap: Record<string, string>;
 }
 
 /**
@@ -872,6 +942,7 @@ export async function prepareRequest(
   let ownsUserId = false;
 
   let body = init?.body;
+  let inboundToolNameMap = INBOUND_TOOL_NAME_MAP;
   if (body && typeof body === "string") {
     try {
       const parsed = JSON.parse(body);
@@ -886,9 +957,22 @@ export async function prepareRequest(
         );
       } catch {}
 
+      // The API rejects a forced tool_choice (any/tool) alongside enabled or
+      // adaptive thinking, and it prefills the forced tool call, so nothing
+      // could be thought before it anyway. The forced tool wins: inject no
+      // thinking, and turn the caller's own off. Models that can't turn
+      // thinking off drop the forced choice instead and keep thinking.
+      let forcesTool = parsed.tool_choice?.type === "any" || parsed.tool_choice?.type === "tool";
+      if (forcesTool && !canDisableThinking(parsed.model)) {
+        delete parsed.tool_choice;
+        forcesTool = false;
+      }
       const supportsThinking = supportsAdaptiveThinking(parsed.model);
-      if (!parsed.thinking && supportsThinking) {
+      if (!parsed.thinking && supportsThinking && !forcesTool) {
         parsed.thinking = { type: "adaptive" };
+      }
+      if (forcesTool && (parsed.thinking?.type === "enabled" || parsed.thinking?.type === "adaptive")) {
+        parsed.thinking = { type: "disabled" };
       }
 
       // Anthropic requires temperature=1 when thinking is enabled/adaptive
@@ -980,22 +1064,21 @@ export async function prepareRequest(
       // routers such as OpenRouter.
       if (opts.claudeTools) {
         if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
+          inboundToolNameMap = getInboundToolNameMapForActiveOpenCodeTools(parsed.tools);
           parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
+          if (parsed.tool_choice?.type === "tool") {
+            parsed.tool_choice = { ...parsed.tool_choice, name: mapOutboundToolName(parsed.tool_choice.name) };
+          }
         }
-        delete parsed.tool_choice;
       }
 
       // Normalize message content blocks:
       // - Translate tool names (OpenCode → Claude Code)
       // - Translate tool_use input arguments (camelCase → snake_case)
-      // - Clean up text blocks
       if (parsed.messages && Array.isArray(parsed.messages)) {
         for (const msg of parsed.messages) {
           if (!Array.isArray(msg.content)) continue;
           for (const block of msg.content) {
-            if (block.type === "text" && typeof block.text === "string") {
-              block.text = maybeUnquoteText(block.text);
-            }
             if (opts.claudeTools && block.type === "tool_use" && block.name) {
               block.name = mapOutboundToolName(block.name);
               // Consolidated OpenCode → Claude argument translation:
@@ -1046,7 +1129,7 @@ export async function prepareRequest(
 
   const outHeaders: Record<string, string> = {};
   headers.forEach((v, k) => { outHeaders[k] = v; });
-  return { finalUrl, outHeaders, body, ownsUserId };
+  return { finalUrl, outHeaders, body, ownsUserId, inboundToolNameMap };
 }
 
 export interface SettleInput {
@@ -1061,6 +1144,8 @@ export interface SettleInput {
   signal?: AbortSignal | null;
   sessionId: string;
   deviceId: string;
+  /** When the response's request was sent; defaults to now. Resends update it. */
+  sentAt?: number;
 }
 
 /**
@@ -1069,8 +1154,15 @@ export interface SettleInput {
  * downstream. Mutates `outHeaders` with the serving account's bearer.
  */
 export async function settlePoolResponse(input: SettleInput): Promise<Response> {
-  const { pool, toast, outHeaders, ownsUserId, send, signal, sessionId, deviceId } = input;
+  const { pool, toast, outHeaders, ownsUserId, signal, sessionId, deviceId } = input;
   let { response, activeLabel, body } = input;
+  // Send time of the latest attempt, so its success can't undo a penalty
+  // recorded while it was in flight.
+  let sentAt = input.sentAt ?? Date.now();
+  const send: SettleInput["send"] = (headers, sendBody) => {
+    sentAt = Date.now();
+    return input.send(headers, sendBody);
+  };
   // Pool-aware failure handling. This runs BEFORE response.body is
   // read below, which is the only point where rotation is safe: once
   // SSE streaming has begun, a second stream's message ids and
@@ -1083,7 +1175,12 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
     const maxRotations = (await pool.listLabels()).length;
     let rotations = 0;
     let attempt = 0;
+    // One wait budget across every retry and account: a pool where each
+    // account says "retry in 60s" would otherwise hang the request for
+    // minutes. Past it, the account cools down and rotation takes over.
+    let waitedMs = 0;
     const tried = new Set<string>();
+    const refreshed = new Set<string>();
     // 401/403 penalties wait until another account SUCCEEDS with the same
     // request: an identical failure blames the request, and a 429 or 5xx
     // from the next account says nothing about the first one.
@@ -1121,6 +1218,7 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
         bodyText,
         now: Date.now(),
         attempt,
+        waitBudgetMs: MAX_RETRY_DELAY_MS - waitedMs,
       });
 
       if (decision.action === "PASS_THROUGH") {
@@ -1134,6 +1232,7 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
 
       if (decision.action === "RETRY_SAME") {
         attempt += 1;
+        waitedMs += decision.backoffMs ?? 1000;
         console.error(
           `[claude-pool] ${activeLabel}: ${decision.reason}; retrying in ${decision.backoffMs ?? 1000}ms`,
         );
@@ -1154,6 +1253,32 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
           `[claude-pool] "${repeated.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
         );
         return rebuild();
+      }
+
+      // A 401 may mean only the access token was revoked while its
+      // refresh token still works: refresh once through the pool's
+      // locked, journaled path and resend before blaming the account.
+      if (response.status === 401 && !refreshed.has(activeLabel)) {
+        refreshed.add(activeLabel);
+        const rejectedToken = outHeaders["authorization"]!.replace(/^Bearer /, "");
+        let freshToken: string | null = null;
+        try {
+          freshToken = (await pool.refreshLabel(activeLabel, rejectedToken)).access;
+        } catch (err) {
+          console.error(
+            `[claude-pool] ${activeLabel}: refresh after 401 failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (freshToken && freshToken !== rejectedToken) {
+          console.error(`[claude-pool] ${activeLabel}: 401 from Anthropic; refreshed the token, retrying once`);
+          outHeaders["authorization"] = `Bearer ${freshToken}`;
+          response = await send(outHeaders, body);
+          if (response.ok) {
+            await confirmPenalties();
+            break;
+          }
+          continue;
+        }
       }
       tried.add(activeLabel);
 
@@ -1225,7 +1350,7 @@ export async function settlePoolResponse(input: SettleInput): Promise<Response> 
 
   if (response.ok) {
     const served = activeLabel;
-    await recordPoolState(`success for "${served}"`, () => pool.markSuccess(served));
+    await recordPoolState(`success for "${served}"`, () => pool.markSuccess(served, sentAt));
   }
   return response;
 }
@@ -1250,18 +1375,27 @@ export async function startPool(client: PoolClient, toast: Toaster): Promise<Sta
   try {
     poolActive = await pool.isActive();
 
-    // Adopt a newly logged-in account automatically. Only once the pool is
-    // already in use, so installing the plugin never silently captures
-    // credentials from someone who has not opted in.
+    // Adopt a newly logged-in account, or repair a disabled one from a fresh
+    // login. Only once the pool is already in use, so installing the plugin
+    // never silently captures credentials from someone who has not opted in.
     if (poolActive && process.env.CLAUDE_POOL_AUTO_ENROLL !== "0") {
+      const rotation = createRotationStateStore({ path: defaultStatePath(), lockPath: defaultLockPath() });
       const adopted = await autoEnrollIfNew({
         accounts: createAccountStore(createSecretBackend()),
+        isDisabled: (label) => rotation.load().accounts[label]?.disabled === true,
       });
       if (adopted.status === "enrolled") {
         console.error(
           `[claude-pool] auto-enrolled "${adopted.label}" (${adopted.email}) from the Claude CLI`,
         );
         toast("success", `Added "${adopted.label}" (${adopted.email}) to the pool`);
+      }
+      if (adopted.status === "repaired") {
+        await rotation.resetHealth(adopted.label!);
+        console.error(
+          `[claude-pool] re-enabled "${adopted.label}" (${adopted.email}) with the Claude CLI's new login`,
+        );
+        toast("success", `Re-enabled "${adopted.label}" (${adopted.email}) with the new login`);
       }
     }
 
@@ -1423,6 +1557,12 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             let activeLabel: string | null = null;
             const usePool = await currentPoolActive();
 
+            // A failed save left the spent refresh token in OpenCode's store.
+            if (!usePool && adoptLatestTokens(auth)) {
+              accessToken = auth.access!;
+              await storeAuth(client, latestTokens!).catch(() => {});
+            }
+
             if (usePool) {
               let acquired: Awaited<ReturnType<typeof pool.acquire>>;
               try {
@@ -1461,15 +1601,20 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const prepared = await prepareRequest(input, init, accessToken, {
               sessionId, deviceId, claudeTools: true, ensureClaudePrefix: false,
             });
-            const { finalUrl, outHeaders, body } = prepared;
+            const { finalUrl, outHeaders, body, inboundToolNameMap } = prepared;
 
-            // ── Request (with 429 auto-refresh retry) ──
-            const doFetch = () => globalThis.fetch(finalUrl, {
-              method: init?.method || "POST",
-              body,
-              headers: outHeaders,
-              signal: init?.signal,
-            });
+            // Send time of the latest attempt, so its success can't undo a
+            // penalty recorded while it was in flight.
+            let sentAt = 0;
+            const doFetch = () => {
+              sentAt = Date.now();
+              return globalThis.fetch(finalUrl, {
+                method: init?.method || "POST",
+                body,
+                headers: outHeaders,
+                signal: init?.signal,
+              });
+            };
 
             let response = await doFetch();
 
@@ -1480,7 +1625,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 send: (headers, sendBody) => globalThis.fetch(finalUrl, {
                   method: init?.method || "POST", body: sendBody, headers, signal: init?.signal,
                 }),
-                signal: init?.signal, sessionId, deviceId,
+                signal: init?.signal, sessionId, deviceId, sentAt,
               });
             }
 
@@ -1515,22 +1660,23 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               if (delayMs === null) break;
               const attempt = `attempt ${retry + 1}/${MAX_RESPONSE_RETRIES}`;
               if (response.status === 429) {
-                // Rate limits may be per access token, so a fresh one can help.
-                console.error(`[opencode-claude-bridge] 429 rate limited (${attempt}), refreshing token...`);
-                let freshToken: string | null = null;
-                try {
-                  freshToken = await refreshAuth(auth, client);
-                } catch (err) {
-                  const detail = err instanceof Error ? err.message : String(err);
-                  console.error(`[opencode-claude-bridge] OAuth refresh failed after 429: ${detail}`);
-                  await response.body?.cancel();
-                  return buildAuthFailureResponse(detail);
+                console.error(`[opencode-claude-bridge] 429 rate limited (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s`);
+                // Only a token about to expire is refreshed: each refresh spends
+                // the single-use refresh token.
+                if (!auth.expires || auth.expires < Date.now() + 60_000) {
+                  let freshToken: string | null = null;
+                  try {
+                    freshToken = await refreshAuth(auth, client);
+                  } catch (err) {
+                    const detail = err instanceof Error ? err.message : String(err);
+                    console.error(`[opencode-claude-bridge] OAuth refresh failed after 429: ${detail}`);
+                  }
+                  if (!freshToken) {
+                    console.error("[opencode-claude-bridge] Token refresh failed, returning 429");
+                    break;
+                  }
+                  outHeaders["authorization"] = `Bearer ${freshToken}`;
                 }
-                if (!freshToken) {
-                  console.error("[opencode-claude-bridge] Token refresh failed, returning 429");
-                  break;
-                }
-                outHeaders["authorization"] = `Bearer ${freshToken}`;
               } else {
                 console.error(`[opencode-claude-bridge] ${response.status} overloaded (${attempt}), retrying in ${Math.ceil(delayMs / 1000)}s`);
               }
@@ -1547,7 +1693,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             // "path"). See src/stream.ts.
             return new Response(
               translateSseStream(response.body, {
-                inboundToolNameMap: INBOUND_TOOL_NAME_MAP,
+                inboundToolNameMap,
                 translateToolArgs: translateToolArgsJsonString,
                 debug: (msg) => console.error(`[opencode-claude-bridge] stream: ${msg}`),
               }),
@@ -1715,4 +1861,15 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   };
 };
 
-export default OpenCodeClaudeBridge;
+/**
+ * opencode plugin module.
+ *
+ * The `{ id, server }` shape is what opencode's plugin loader looks for. A bare
+ * function default export makes it fall back to its legacy path, which treats
+ * every named export of this module as a plugin factory and invokes it with
+ * `(input, options)` — crashing on the helpers exported here for tests.
+ */
+export default {
+  id: PLUGIN_ID,
+  server: OpenCodeClaudeBridge,
+};

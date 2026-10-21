@@ -256,16 +256,22 @@ function decisionFromReset(
   reset: ResetWindow,
   now: number,
   attempt: number,
+  waitBudgetMs: number,
 ): RotationDecision {
   const durationMs = safeDurationMs(reset.seconds);
+  const backoffMs = Math.max(1000, durationMs);
   // A short reset means "wait briefly and retry the same account" — but an
   // account that keeps returning a short window would otherwise be retried
-  // forever, hanging the request. After a few attempts, treat it as exhausted
-  // and let rotation take over.
-  if (reset.seconds <= RETRY_SAME_MAX_RESET_SECONDS && attempt < MAX_TRANSIENT_ATTEMPTS) {
+  // forever, hanging the request. After a few attempts, or once the wait would
+  // overrun the request's budget, treat it as exhausted and let rotation take over.
+  if (
+    reset.seconds <= RETRY_SAME_MAX_RESET_SECONDS &&
+    attempt < MAX_TRANSIENT_ATTEMPTS &&
+    backoffMs <= waitBudgetMs
+  ) {
     return {
       action: "RETRY_SAME",
-      backoffMs: Math.max(1000, durationMs),
+      backoffMs,
       reason: `Rate limit resets in ${reset.seconds} seconds`,
       source: reset.source,
     };
@@ -312,6 +318,7 @@ function resolveWindows(headers: unknown, now: number): RotationDecision["window
 function classifyInternal(input: ClassifyInput): RotationDecision {
   const status = input.status;
   const now = finiteNow(input.now);
+  const waitBudgetMs = input.waitBudgetMs ?? Number.POSITIVE_INFINITY;
 
   if (status >= 200 && status < 300) return passThrough("Successful response");
 
@@ -371,7 +378,7 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
     }
 
     if (reset !== undefined) {
-      return { ...decisionFromReset(reset, now, input.attempt ?? 0), windows };
+      return { ...decisionFromReset(reset, now, input.attempt ?? 0, waitBudgetMs), windows };
     }
     return {
       action: "ROTATE_COOLDOWN",
@@ -386,10 +393,11 @@ function classifyInternal(input: ClassifyInput): RotationDecision {
       typeof input.attempt === "number" && Number.isFinite(input.attempt) && input.attempt >= 0
         ? Math.floor(input.attempt)
         : 0;
-    if (attempt < MAX_TRANSIENT_ATTEMPTS) {
+    const backoffMs = 1000 * 2 ** attempt;
+    if (attempt < MAX_TRANSIENT_ATTEMPTS && backoffMs <= waitBudgetMs) {
       return {
         action: "RETRY_SAME",
-        backoffMs: 1000 * 2 ** attempt,
+        backoffMs,
         reason: `Transient server error; retry attempt ${attempt + 1}`,
         source: "status",
       };

@@ -21,7 +21,8 @@ const USAGE = [
   "",
   "  enroll [label] [--replace]  add the account Claude CLI is logged into",
   "                              (label defaults to the account's email name)",
-  "  auto                        enroll the logged-in account if the pool has not seen it",
+  "  auto                        enroll the logged-in account if the pool has not seen it,",
+  "                              or repair its disabled entry (does nothing on an empty pool)",
   "  install-hook                print a shell function that runs `auto` after `claude login`",
   "  whoami                      show which account Claude CLI is logged into",
   "  status                      show active account and what rotation picks next",
@@ -116,15 +117,26 @@ async function enroll(label, flags = []) {
 }
 
 async function auto() {
-  const result = await autoEnrollIfNew({ accounts });
+  const result = await autoEnrollIfNew({
+    accounts,
+    isDisabled: (label) => state.load().accounts[label]?.disabled === true,
+  });
   switch (result.status) {
     case "enrolled":
       await state.resetHealth(result.label);
       console.log(`Enrolled "${result.label}" (${result.email}).`);
       await warnIfSharingLogin();
       break;
+    case "repaired":
+      await state.resetHealth(result.label);
+      console.log(`Re-enabled "${result.label}" (${result.email}) with the new login.`);
+      await warnIfSharingLogin();
+      break;
     case "already-enrolled":
       console.log(`Already pooled as "${result.label}".`);
+      break;
+    case "pool-empty":
+      console.log("The pool is empty; enroll the first account by hand: claude-pool enroll");
       break;
     case "stale":
       console.log("Claude CLI credential is expired; run `claude login` first.");
@@ -138,7 +150,9 @@ async function auto() {
 }
 
 async function installHook() {
-  const self = new URL(import.meta.url).pathname;
+  // URL.pathname is percent-encoded (a space becomes %20); single-quote the
+  // decoded path so spaces and quotes in the checkout path survive the shell.
+  const self = `'${fileURLToPath(import.meta.url).replaceAll("'", "'\\''")}'`;
   console.log(`# --- opencode-claude-bridge account pool ---
 # Add to ~/.zshrc, then: source ~/.zshrc
 # A function, not an alias: aliases are expanded at parse time and are not

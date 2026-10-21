@@ -305,6 +305,8 @@ export function translateArgsOpencodeToClaude(
   //    { activeForm, status∈{pending,in_progress,completed} }.
   if (toolName === "TodoWrite" && Array.isArray(out.todos)) {
     for (const item of out.todos as Array<Record<string, unknown>>) {
+      // Skip malformed entries: a throw here aborts the whole request rewrite.
+      if (!item || typeof item !== "object") continue;
       if (item.priority && !item.activeForm) {
         item.activeForm = item.priority;
         delete item.priority;
@@ -318,6 +320,7 @@ export function translateArgsOpencodeToClaude(
   // 4. AskUserQuestion: OpenCode uses "multiple", Claude uses "multiSelect".
   if (toolName === "AskUserQuestion" && Array.isArray(out.questions)) {
     for (const item of out.questions as Array<Record<string, unknown>>) {
+      if (!item || typeof item !== "object") continue;
       if (typeof item.multiple === "boolean" && item.multiSelect === undefined) {
         item.multiSelect = item.multiple;
         delete item.multiple;

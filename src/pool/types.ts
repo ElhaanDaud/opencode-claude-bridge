@@ -168,6 +168,8 @@ export interface ClassifyInput {
   now: number;
   /** Consecutive RETRY_SAME attempts already made for this request. */
   attempt?: number;
+  /** Wait (ms) this request may still spend retrying in place; unlimited when absent. */
+  waitBudgetMs?: number;
 }
 
 // ── Selection ───────────────────────────────────────────────────────

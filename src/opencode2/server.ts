@@ -51,7 +51,7 @@ export interface V2Context {
 }
 
 type Pending =
-  | { kind: "pool"; label: string; prepared: PreparedRequest; method: string; signal: AbortSignal | null }
+  | { kind: "pool"; label: string; prepared: PreparedRequest; method: string; signal: AbortSignal | null; sentAt: number }
   | { kind: "single" }
   | { kind: "replace"; build: () => Response };
 
@@ -136,7 +136,7 @@ async function setup(ctx: V2Context): Promise<void> {
     event.request = rewritten;
     pending.set(
       rewritten,
-      label ? { kind: "pool", label, prepared, method, signal } : { kind: "single" },
+      label ? { kind: "pool", label, prepared, method, signal, sentAt: Date.now() } : { kind: "single" },
     );
   };
 
@@ -156,7 +156,7 @@ async function setup(ctx: V2Context): Promise<void> {
     }
     if (entry.kind !== "pool") return;
 
-    const { prepared, method, signal } = entry;
+    const { prepared, method, signal, sentAt } = entry;
     event.response = await settlePoolResponse({
       pool,
       toast,
@@ -169,6 +169,7 @@ async function setup(ctx: V2Context): Promise<void> {
       signal,
       sessionId,
       deviceId,
+      sentAt,
     });
   };
 

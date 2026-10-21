@@ -60,6 +60,12 @@ export function getCliVersion(): string {
   return cliVersion;
 }
 
+/**
+ * Identity opencode registers this plugin under. Required: opencode refuses to
+ * load a plugin referenced by filesystem path unless its module exports an id.
+ */
+export const PLUGIN_ID = "opencode-claude-bridge";
+
 export const CLIENT_ID =
   process.env.ANTHROPIC_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 

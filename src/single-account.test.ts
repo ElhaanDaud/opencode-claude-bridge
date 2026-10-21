@@ -5,9 +5,11 @@
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 
 const promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "single-account-prompt-"));
 process.env.ANTHROPIC_SYSTEM_PROMPT_PATH = path.join(promptDir, "claude-system-prompt.json");
@@ -17,6 +19,30 @@ fs.writeFileSync(
 );
 process.env.CLAUDE_POOL_AUTO_ENROLL = "0";
 Object.defineProperty(process, "platform", { value: "linux" });
+
+// Local token endpoint where each refresh token works once, as in production.
+// TOKEN_URL is read at import time.
+const liveRefreshTokens = new Set<string>();
+const refreshRequests: string[] = [];
+const tokenServer = http.createServer((req, res) => {
+  let raw = "";
+  req.on("data", (chunk) => { raw += chunk; });
+  req.on("end", () => {
+    const token = String(JSON.parse(raw).refresh_token);
+    refreshRequests.push(token);
+    res.setHeader("content-type", "application/json");
+    if (!liveRefreshTokens.delete(token)) {
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: "invalid_grant" }));
+      return;
+    }
+    liveRefreshTokens.add(`${token}/next`);
+    res.end(JSON.stringify({ access_token: `${token}/access`, refresh_token: `${token}/next`, expires_in: 3600 }));
+  });
+});
+await new Promise<void>((resolve) => tokenServer.listen(0, "127.0.0.1", resolve));
+process.env.ANTHROPIC_TOKEN_URL = `http://127.0.0.1:${(tokenServer.address() as AddressInfo).port}/v1/oauth/token`;
+after(() => tokenServer.close());
 
 const { default: plugin } = await import("./index.js");
 const { getResponseRetryDelayMs, getTokenRetryDelayMs, parseRetryAfterMs } = await import("./retry.js");
@@ -49,7 +75,7 @@ async function send(replies: Reply[], body: unknown) {
     return new Response(reply.body ?? "{}", { status: reply.status, headers: reply.headers });
   }) as typeof fetch;
 
-  const hooks = await plugin({ client: { auth: { set: async () => {} } } });
+  const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
   const loaded = await hooks.auth.loader(
     async () => ({ type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 }),
     { models: {} },
@@ -88,6 +114,71 @@ describe("single-account retry", () => {
     assert.equal(status, 529);
     assert.equal(sent.length, 3);
   });
+
+  it("retries a 429 without spending the refresh token of a valid access token", async () => {
+    const before = refreshRequests.length;
+    const { status, sent } = await send([{ status: 429, headers: { "retry-after": "0" } }, OK], plain);
+    assert.equal(status, 200);
+    assert.equal(sent.length, 2);
+    assert.deepEqual(refreshRequests.slice(before), []);
+  });
+});
+
+type StoredAuth = { type: string; access: string; refresh: string; expires: number };
+
+/** A loaded fetch whose getAuth() re-reads `store`, as OpenCode's does. */
+async function connect(store: { auth: StoredAuth }, save: (body: StoredAuth) => Promise<void>) {
+  const bearers: string[] = [];
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    if (!String(url).includes("/v1/messages")) return new Response("{}", { status: 404 });
+    bearers.push((init?.headers as Record<string, string>).authorization!);
+    return new Response(OK.body, { status: 200 });
+  }) as typeof fetch;
+
+  const hooks = await plugin.server({
+    client: { auth: { set: async ({ body }: { body: Record<string, unknown> }) => save(body as StoredAuth) } },
+  });
+  const loaded = await hooks.auth.loader(async () => ({ ...store.auth }), { models: {} }) as { fetch: typeof fetch };
+  const call = async () => {
+    const response = await loaded.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify(plain),
+    });
+    await response.text();
+    return response.status;
+  };
+  return { call, bearers };
+}
+
+describe("single-account refresh", () => {
+  it("shares one refresh between concurrent requests", async () => {
+    liveRefreshTokens.add("shared");
+    const store = { auth: { type: "oauth", access: "old", refresh: "shared", expires: Date.now() - 1000 } };
+    const { call, bearers } = await connect(store, async (body) => { store.auth = body; });
+    const before = refreshRequests.length;
+
+    assert.deepEqual(await Promise.all([call(), call()]), [200, 200]);
+    assert.deepEqual(refreshRequests.slice(before), ["shared"]);
+    assert.deepEqual(bearers, ["Bearer shared/access", "Bearer shared/access"]);
+  });
+
+  it("keeps tokens whose save failed, and saves them on the next request", async () => {
+    liveRefreshTokens.add("unsaved");
+    const store = { auth: { type: "oauth", access: "old", refresh: "unsaved", expires: Date.now() - 1000 } };
+    let failures = 1;
+    const { call, bearers } = await connect(store, async (body) => {
+      if (failures-- > 0) throw new Error("auth store unavailable");
+      store.auth = body;
+    });
+    const before = refreshRequests.length;
+
+    assert.equal(await call(), 200);
+    assert.equal(store.auth.refresh, "unsaved");
+    assert.equal(await call(), 200);
+    assert.deepEqual(refreshRequests.slice(before), ["unsaved"]);
+    assert.deepEqual(bearers, ["Bearer unsaved/access", "Bearer unsaved/access"]);
+    assert.equal(store.auth.refresh, "unsaved/next");
+  });
 });
 
 describe("request body rewrite", () => {
@@ -103,6 +194,63 @@ describe("request body rewrite", () => {
     assert.equal(texts.filter((text) => text.startsWith("x-anthropic-billing-header:")).length, 1);
   });
 
+  describe("tool_choice", () => {
+    const schema = { type: "object", properties: {} };
+    const withTools = {
+      model: "claude-opus-5-5",
+      messages: plain.messages,
+      tools: [
+        { name: "bash", description: "run", input_schema: schema },
+        { name: "StructuredOutput", description: "answer", input_schema: schema },
+      ],
+    };
+
+    it("keeps a forced tool, maps its name, and injects no thinking", async () => {
+      for (const [name, wire] of [["StructuredOutput", "StructuredOutput"], ["bash", "Bash"]]) {
+        const { sent } = await send([OK], { ...withTools, tool_choice: { type: "tool", name } });
+        assert.deepEqual(sent[0]!.tool_choice, { type: "tool", name: wire });
+        assert.ok((sent[0]!.tools as Array<{ name: string }>).some((tool) => tool.name === wire));
+        assert.equal(sent[0]!.thinking, undefined);
+      }
+    });
+
+    it("turns the caller's thinking off when it forces a tool", async () => {
+      const { sent } = await send([OK], {
+        ...withTools,
+        tool_choice: { type: "any" },
+        thinking: { type: "enabled", budget_tokens: 2048 },
+        temperature: 0,
+      });
+      assert.deepEqual(sent[0]!.tool_choice, { type: "any" });
+      assert.deepEqual(sent[0]!.thinking, { type: "disabled" });
+      assert.equal(sent[0]!.temperature, 0);
+    });
+
+    it("drops a forced tool for Sonnet 5.5, which can't turn thinking off", async () => {
+      const sonnet = { ...withTools, model: "claude-sonnet-5-5" };
+      for (const extra of [
+        { tool_choice: { type: "tool", name: "bash" } },
+        { tool_choice: { type: "any" }, thinking: { type: "enabled", budget_tokens: 2048 } },
+      ]) {
+        const { sent } = await send([OK], { ...sonnet, ...extra });
+        assert.equal(sent[0]!.tool_choice, undefined);
+        assert.deepEqual(sent[0]!.thinking, { type: "adaptive" });
+      }
+      for (const choice of [{ type: "auto" }, { type: "none" }]) {
+        const { sent } = await send([OK], { ...sonnet, tool_choice: choice });
+        assert.deepEqual(sent[0]!.tool_choice, choice);
+      }
+    });
+
+    it("keeps auto and none alongside adaptive thinking", async () => {
+      for (const choice of [{ type: "auto", disable_parallel_tool_use: true }, { type: "none" }]) {
+        const { sent } = await send([OK], { ...withTools, tool_choice: choice });
+        assert.deepEqual(sent[0]!.tool_choice, choice);
+        assert.deepEqual(sent[0]!.thinking, { type: "adaptive" });
+      }
+    });
+  });
+
   it("ends an assistant-tailed request on a user turn and keeps the tail cache marker", async () => {
     const marker = { type: "ephemeral" };
     const { sent } = await send([OK], {
@@ -116,6 +264,68 @@ describe("request body rewrite", () => {
     assert.equal(messages.at(-1)!.role, "user");
     assert.equal("cache_control" in (messages[0]!.content as Array<object>)[0]!, false);
     assert.deepEqual((messages[1]!.content as Array<{ cache_control?: unknown }>)[0]!.cache_control, marker);
+  });
+
+  it("sends text that is a quoted string verbatim instead of JSON-decoding it", async () => {
+    const texts = ['"hello"', '"a\\nb"', ' "padded" '];
+    const { sent } = await send([OK], {
+      ...plain,
+      messages: [
+        { role: "user", content: [{ type: "text", text: texts[0] }] },
+        { role: "assistant", content: [{ type: "text", text: texts[1] }] },
+        { role: "user", content: [{ type: "text", text: texts[2] }] },
+      ],
+    });
+    const messages = sent[0]!.messages as Array<{ content: Array<{ text: string }> }>;
+    assert.deepEqual(messages.map((message) => message.content[0]!.text), texts);
+  });
+});
+
+describe("OAuth profile lookup", () => {
+  /** Sends `count` requests on token `access`, with `profile` answering the profile endpoint. */
+  async function sendAs(access: string, count: number, profile: (init?: RequestInit) => Promise<Response>) {
+    const sent: Array<Record<string, unknown>> = [];
+    let lookups = 0;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).includes("/oauth/profile")) {
+        lookups++;
+        return profile(init);
+      }
+      if (!String(url).includes("/v1/messages")) return new Response("{}", { status: 404 });
+      sent.push(JSON.parse(String(init?.body)));
+      return new Response(OK.body, { status: OK.status });
+    }) as typeof fetch;
+
+    const hooks = await plugin.server({ client: { auth: { set: async () => {} } } });
+    const loaded = await hooks.auth.loader(
+      async () => ({ type: "oauth", access, refresh: "refresh", expires: Date.now() + 3_600_000 }),
+      { models: {} },
+    ) as { fetch: typeof fetch };
+    const statuses: number[] = [];
+    for (let i = 0; i < count; i++) {
+      const response = await loaded.fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        body: JSON.stringify(plain),
+      });
+      await response.text();
+      statuses.push(response.status);
+    }
+    return { statuses, sent, lookups };
+  }
+
+  it("sends the request without user_id when the profile endpoint never answers", { timeout: 15_000 }, async () => {
+    // Accepts the connection and never answers; only the abort signal ends it.
+    const { statuses, sent } = await sendAs("stalled-profile", 1, (init) => new Promise((_, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+    }));
+    assert.deepEqual(statuses, [200]);
+    assert.equal((sent[0]!.metadata as { user_id?: string }).user_id, undefined);
+  });
+
+  it("does not repeat a failed lookup on every request", async () => {
+    const { statuses, lookups } = await sendAs("failed-profile", 2, async () => new Response("{}", { status: 500 }));
+    assert.deepEqual(statuses, [200, 200]);
+    assert.equal(lookups, 1);
   });
 });
 

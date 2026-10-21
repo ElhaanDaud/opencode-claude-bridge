@@ -197,7 +197,7 @@ describe("re-enrolling after a re-login", () => {
     claudeAiOauth: {
       accessToken: "sk-ant-oat01-new",
       refreshToken: "sk-ant-ort01-new",
-      expiresAt: NOW + 3_600_000,
+      expiresAt: NOW + 7_200_000,
       subscriptionType: "max",
     },
   });
@@ -219,6 +219,43 @@ describe("re-enrolling after a re-login", () => {
     const accounts = await store.listAccounts();
     assert.equal(accounts.length, 1);
     assert.equal(accounts[0]?.oauth.refresh, "sk-ant-ort01-new");
+  });
+
+  it("keeps the pool's tokens when the CLI's copy is older, as it is after a pool refresh", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(relogin), NOW, "alice@example.com"),
+    );
+
+    for (const label of [undefined, "alice"]) {
+      await assert.rejects(
+        enrollFromClaudeCli({
+          accounts: store,
+          label,
+          clock: () => NOW,
+          resolveEmail: async () => "alice@example.com",
+          readCredentials: () => VALID_CLI_JSON,
+        }),
+        (err: Error) => err instanceof EnrollmentError && /newer credentials/.test(err.message),
+      );
+    }
+    assert.equal((await store.listAccounts())[0]?.oauth.refresh, "sk-ant-ort01-new");
+  });
+
+  it("re-enrolls an unchanged login for the same email", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW - 5000, "alice@example.com"),
+    );
+
+    const record = await enrollFromClaudeCli({
+      accounts: store,
+      clock: () => NOW,
+      resolveEmail: async () => "alice@example.com",
+      readCredentials: () => VALID_CLI_JSON,
+    });
+
+    assert.equal(record.enrolledAt, NOW);
   });
 
   it("refuses a second label for an email that is already enrolled", async () => {
@@ -377,6 +414,25 @@ describe("automatic enrollment", () => {
     assert.equal((await store.listAccounts()).length, 2);
   });
 
+  it("does nothing when the pool is empty", async () => {
+    const store = createAccountStore(memoryBackend());
+    let resolved = false;
+
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => cli("sk-ant-ort01-first"),
+      resolveEmail: async () => {
+        resolved = true;
+        return "bob@example.com";
+      },
+    });
+
+    assert.equal(result.status, "pool-empty");
+    assert.equal(resolved, false);
+    assert.equal((await store.listAccounts()).length, 0);
+  });
+
   it("does nothing when the CLI account is already pooled", async () => {
     const store = createAccountStore(memoryBackend());
     await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW));
@@ -444,20 +500,77 @@ describe("automatic enrollment", () => {
       toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, "Alice@Example.com"),
     );
 
+    // Older than the pool's copy: the CLI's token was spent by a pool refresh,
+    // so it cannot repair the entry even when rotation has disabled it.
     const result = await autoEnrollIfNew({
       accounts: store,
       clock: () => NOW,
-      readCredentials: () => cli("sk-ant-ort01-rotated"),
+      readCredentials: () => cli("sk-ant-ort01-rotated", 1_800_000),
       resolveEmail: async () => "alice@example.com",
+      isDisabled: () => true,
     });
 
     assert.equal(result.status, "already-enrolled");
     assert.equal(result.label, "alice");
-    assert.equal((await store.listAccounts()).length, 1);
+    const accounts = await store.listAccounts();
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]?.oauth.refresh, "sk-ant-ort01-xyz");
+  });
+
+  it("leaves a healthy pooled account's entry alone after a newer login", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, "alice@example.com"),
+    );
+
+    // Copying the login in would make the pool and the CLI share one refresh token.
+    const checks = [undefined, () => false, () => { throw new Error("state unreadable"); }];
+    for (const isDisabled of checks) {
+      const result = await autoEnrollIfNew({
+        accounts: store,
+        clock: () => NOW,
+        readCredentials: () => cli("sk-ant-ort01-relogin", 7_200_000),
+        resolveEmail: async () => "alice@example.com",
+        isDisabled,
+      });
+
+      assert.equal(result.status, "already-enrolled");
+      assert.equal(result.label, "alice");
+    }
+    const accounts = await store.listAccounts();
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]?.oauth.refresh, "sk-ant-ort01-xyz");
+  });
+
+  it("repairs a disabled account's entry from a newer login", async () => {
+    const store = createAccountStore(memoryBackend());
+    await store.putAccount(
+      toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW, "alice@example.com"),
+    );
+    const asked: string[] = [];
+
+    const result = await autoEnrollIfNew({
+      accounts: store,
+      clock: () => NOW,
+      readCredentials: () => cli("sk-ant-ort01-relogin", 7_200_000),
+      resolveEmail: async () => "alice@example.com",
+      isDisabled: async (label) => {
+        asked.push(label);
+        return true;
+      },
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.equal(result.label, "alice");
+    assert.deepEqual(asked, ["alice"]);
+    const accounts = await store.listAccounts();
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]?.oauth.refresh, "sk-ant-ort01-relogin");
   });
 
   it("skips accounts whose email cannot be resolved", async () => {
     const store = createAccountStore(memoryBackend());
+    await store.putAccount(toAccountRecord("alice", parseClaudeCredentials(VALID_CLI_JSON), NOW));
     const result = await autoEnrollIfNew({
       accounts: store,
       clock: () => NOW,
@@ -466,7 +579,7 @@ describe("automatic enrollment", () => {
     });
 
     assert.equal(result.status, "no-label");
-    assert.equal((await store.listAccounts()).length, 0);
+    assert.equal((await store.listAccounts()).length, 1);
   });
 });
 

@@ -20,7 +20,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { ROTATION_STATE_VERSION } from "./types.js";
 import type { AccountState, Clock, RotationState } from "./types.js";
@@ -107,13 +107,17 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     }
   }
 
-  function load(): RotationState {
+  /** Returns null for a file that exists but is unusable (malformed or unknown version). */
+  function read(): RotationState | null {
     let raw: string;
     try {
       raw = fs.readFileSync(statePath, "utf8");
-    } catch {
-      // Missing or unreadable simply means a fresh pool, not an error.
-      return defaultRotationState();
+    } catch (err) {
+      // Only a missing file means a fresh pool. Any other read error (EACCES,
+      // EIO, EMFILE) leaves the real state on disk, and defaults saved over it
+      // would drop every cooldown and put disabled accounts back in rotation.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return defaultRotationState();
+      throw err;
     }
 
     let parsed: unknown;
@@ -123,7 +127,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       console.error(
         `[claude-pool] rotation state at ${statePath} is malformed JSON; falling back to defaults`,
       );
-      return defaultRotationState();
+      return null;
     }
 
     if (
@@ -134,7 +138,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       console.error(
         `[claude-pool] rotation state at ${statePath} has an unsupported version; falling back to defaults`,
       );
-      return defaultRotationState();
+      return null;
     }
 
     const state = parsed as RotationState;
@@ -143,6 +147,24 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       activeLabel: state.activeLabel ?? null,
       accounts: state.accounts ?? {},
     };
+  }
+
+  function load(): RotationState {
+    return read() ?? defaultRotationState();
+  }
+
+  /**
+   * Load for a write. An unusable file is moved aside first so the save that
+   * follows cannot destroy it. Only done under the lock: a reader renaming it
+   * unlocked could move aside a fresh state another process just saved.
+   */
+  function loadLocked(): RotationState {
+    const state = read();
+    if (state) return state;
+    const aside = `${statePath}.corrupt-${clock()}`;
+    fs.renameSync(statePath, aside);
+    console.error(`[claude-pool] moved unusable rotation state to ${aside}; starting fresh`);
+    return defaultRotationState();
   }
 
   function save(state: RotationState): void {
@@ -170,12 +192,31 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     }
   }
 
-  function readLock(): LockPayload | null {
+  /** The lockfile's exact bytes, or null if it is missing or unreadable. */
+  function readLockBytes(): Buffer | null {
     try {
-      return JSON.parse(fs.readFileSync(lockPath, "utf8")) as LockPayload;
+      return fs.readFileSync(lockPath);
     } catch {
       return null;
     }
+  }
+
+  function parseLock(raw: Buffer | null): LockPayload | null {
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw.toString("utf8")) as LockPayload;
+    } catch {
+      return null;
+    }
+  }
+
+  function readLock(): LockPayload | null {
+    return parseLock(readLockBytes());
+  }
+
+  /** Keyed on bytes, not the nonce, so locks written without one still work. */
+  function reclaimPath(observed: Buffer): string {
+    return `${lockPath}.reclaim-${createHash("sha256").update(observed).digest("hex").slice(0, 16)}`;
   }
 
   /** Atomically create the lockfile. Returns our nonce, or null if held. */
@@ -208,10 +249,17 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
    *
    * The naive approach — "if it looks stale, unlink it" — has a real race: two
    * waiters both see the stale lock, the first reclaims and acquires, then the
-   * second deletes that *fresh* lock, leaving two holders. We guard by renaming
-   * the lockfile aside and verifying the bytes we moved carry the same nonce we
-   * observed. If they differ, someone already reclaimed it, so we put it back
-   * and keep waiting.
+   * second deletes that *fresh* lock, leaving two holders. Moving it aside and
+   * restoring it on a mismatch is no better: the restore can land on a third
+   * waiter's new lock. POSIX has no atomic compare-and-unlink, so instead a
+   * reclaimer first creates a claim file keyed on the exact bytes it observed,
+   * and only the claim holder may unlink, and only while the lockfile still
+   * holds those bytes. A replacement, even one created but not yet written,
+   * differs and is left alone.
+   *
+   * This fails closed. A reclaimer that dies holding the claim leaves the stale
+   * lock in place, and acquire() times out naming the claim until someone
+   * deletes it. Recovering from that automatically reopens the two-holder race.
    */
   /**
    * Age alone is not a crash signal — it is a timeout, and the guarded refresh
@@ -232,31 +280,23 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
     }
   }
 
-  function tryReclaimStale(observed: LockPayload): boolean {
-    const aside = `${lockPath}.${randomUUID()}.stale`;
+  function tryReclaimStale(observed: Buffer): boolean {
+    const claim = reclaimPath(observed);
     try {
-      fs.renameSync(lockPath, aside);
+      fs.closeSync(fs.openSync(claim, "wx", 0o600));
     } catch {
-      return false; // Someone else got there first.
+      return false; // Another waiter is reclaiming this lock.
     }
-
-    let moved: LockPayload | null = null;
     try {
-      moved = JSON.parse(fs.readFileSync(aside, "utf8")) as LockPayload;
+      // Any mismatch means it was already reclaimed and replaced.
+      if (!fs.readFileSync(lockPath).equals(observed)) return false;
+      fs.rmSync(lockPath);
+      return true;
     } catch {
-      moved = null;
-    }
-
-    // Unparseable means a rival's lock caught between create and write, not
-    // the stale one we observed: restore it. Torn files age out in acquire().
-    if (!moved || moved.nonce !== observed.nonce) {
-      // We moved a lock that had already been replaced — restore it.
-      try { fs.renameSync(aside, lockPath); } catch { /* best effort */ }
       return false;
+    } finally {
+      try { fs.rmSync(claim, { force: true }); } catch { /* best effort */ }
     }
-
-    try { fs.rmSync(aside, { force: true }); } catch { /* best effort */ }
-    return true;
   }
 
   async function acquire(): Promise<string> {
@@ -267,14 +307,15 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       const nonce = tryCreateLock();
       if (nonce) return nonce;
 
-      const existing = readLock();
+      const raw = readLockBytes();
+      const existing = parseLock(raw);
 
       // An unparseable lockfile is usually a torn write, which must not wedge
       // the pool forever. But it is also what a lock looks like in the instant
       // between being created and being written, so removing it on sight would
       // evict a holder that is mid-acquisition. Only discard it once it is old
       // enough that no in-progress acquisition could still be responsible.
-      if (!existing) {
+      if (!raw || !existing) {
         let age = Infinity;
         try {
           age = clock() - fs.statSync(lockPath).mtimeMs;
@@ -283,24 +324,25 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
         }
         if (age > staleLockMs) {
           try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
-        } else {
-          await sleep(lockPollMs);
         }
-        continue;
-      }
-
-      if (clock() - existing.acquiredAt > staleLockMs && holderIsGone(existing)) {
-        if (tryReclaimStale(existing)) {
+      } else if (clock() - existing.acquiredAt > staleLockMs && holderIsGone(existing)) {
+        if (tryReclaimStale(raw)) {
           const reclaimed = tryCreateLock();
           if (reclaimed) return reclaimed;
         }
-        continue;
       }
 
+      // Short of the lockfile vanishing under us, every path lands here, so
+      // neither a torn lockfile nor a failing reclaim outlasts the deadline.
       if (clock() >= deadline) {
+        const holder = existing ? `held by pid ${existing.pid} on ${existing.hostname}` : "lockfile unreadable";
+        const claim = raw ? reclaimPath(raw) : null;
+        const stuck = claim && fs.existsSync(claim)
+          ? `; a reclaim of this stale lock was interrupted, so delete ${claim} if no process is still reclaiming it`
+          : "";
         throw new LockTimeoutError(
           `[claude-pool] timed out after ${lockTimeoutMs}ms waiting for the rotation lock at ${lockPath} ` +
-            `(held by pid ${existing.pid} on ${existing.hostname})`,
+            `(${holder})${stuck}`,
         );
       }
 
@@ -326,7 +368,7 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
   ): Promise<T> {
     const nonce = await acquire();
     try {
-      const state = load();
+      const state = loadLocked();
       // Persist only on real change. Several callers (notably token refresh)
       // take the lock for its mutual exclusion and never touch the state, and
       // rewriting the file for them burns an fsync on every request.
@@ -423,8 +465,12 @@ export function createRotationStateStore(opts: RotationStateStoreOptions) {
       });
     },
 
-    async markSuccess(label: string): Promise<void> {
+    /** `sentAt`: when the successful request went out. */
+    async markSuccess(label: string, sentAt: number): Promise<void> {
       await mutateAccount(label, (account, now) => {
+        // Anything recorded since the request went out (e.g. a concurrent
+        // request's 429) is newer news than this success, so it stands.
+        if (account.updatedAt > sentAt) return;
         account.cooldownUntil = null;
         account.failureCount = 0;
         account.updatedAt = now;

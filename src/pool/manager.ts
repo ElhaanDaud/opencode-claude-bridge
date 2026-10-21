@@ -20,7 +20,9 @@
  *   5. delete the journal
  *   6. mirror to opencode's single `anthropic` slot
  *
- * A journal found at startup means we died between 3 and 5, so we replay it.
+ * A journal found at startup means we died between 3 and 5, so we replay it,
+ * unless its account is gone or no longer holds the token it replaced; such a
+ * journal is renamed aside, never deleted, as it may hold the only live token.
  * The irreducible risk is a crash between 2 and 3, which is microseconds wide.
  *
  * SOURCE OF TRUTH
@@ -80,6 +82,8 @@ interface JournalEntry {
   label: string;
   tokens: PoolOAuthTokens;
   writtenAt: number;
+  /** Refresh token these tokens replace. Absent in journals from older versions. */
+  replaces?: string;
 }
 
 export interface ExhaustionInfo {
@@ -188,16 +192,36 @@ export function createRotationManager(opts: ManagerOptions) {
     const tmp = `${journalPath}.${randomUUID()}.tmp`;
     const fd = fs.openSync(tmp, "wx", 0o600);
     try {
-      fs.writeSync(fd, JSON.stringify(entry));
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
+      try {
+        fs.writeSync(fd, JSON.stringify(entry));
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(tmp, journalPath);
+    } catch (err) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+      throw err;
     }
-    fs.renameSync(tmp, journalPath);
   }
 
   function clearJournal(): void {
     try { fs.rmSync(journalPath, { force: true }); } catch { /* best effort */ }
+  }
+
+  /** Move a journal out of the replay path. Rename, never delete: it may hold the only live token. */
+  function setAsideJournal(label: string, reason: string): void {
+    const aside = `${journalPath}.${randomUUID()}.stale`;
+    try {
+      fs.renameSync(journalPath, aside);
+      console.error(`[claude-pool] set aside refresh journal for "${label}" (${reason}): ${aside}`);
+    } catch (err) {
+      console.error(
+        `[claude-pool] failed to set aside refresh journal for "${label}": ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   function readJournal(): JournalEntry | null {
@@ -221,6 +245,13 @@ export function createRotationManager(opts: ManagerOptions) {
   async function commitPendingJournalLocked(): Promise<JournalEntry | null> {
     const entry = readJournal();
     if (!entry) return null;
+    // Replay only onto the token the refresh started from. Otherwise a removed
+    // account makes every refresh throw, and a re-enrolled one gets old tokens.
+    const current = await accounts.getAccount(entry.label);
+    if (!current || (entry.replaces !== undefined && current.oauth.refresh !== entry.replaces)) {
+      setAsideJournal(entry.label, current ? "stored tokens are newer" : "account not enrolled");
+      return null;
+    }
     await accounts.updateTokens(entry.label, entry.tokens);
     clearJournal();
     console.error(
@@ -246,8 +277,10 @@ export function createRotationManager(opts: ManagerOptions) {
 
   // ── Enrollment / activation ───────────────────────────────────────
 
+  // Labels, not readable records: a locked keychain must not read as "none
+  // enrolled", or single-account mode spends the pool's refresh token.
   async function listLabels(): Promise<string[]> {
-    return (await accounts.listAccounts()).map((a) => a.label);
+    return accounts.listLabels();
   }
 
   /**
@@ -275,8 +308,11 @@ export function createRotationManager(opts: ManagerOptions) {
   /**
    * Refresh one account. The lock makes this safe across processes; the
    * in-flight map collapses duplicates within this process.
+   *
+   * `rejectedAccess` forces the refresh while that access token is still the
+   * stored one, however fresh it looks: Anthropic has already refused it.
    */
-  async function refreshLabel(label: string): Promise<PoolOAuthTokens> {
+  async function refreshLabel(label: string, rejectedAccess?: string): Promise<PoolOAuthTokens> {
     const existing = inFlight.get(label);
     if (existing) return existing;
 
@@ -288,13 +324,22 @@ export function createRotationManager(opts: ManagerOptions) {
         // Re-read inside the critical section before burning our token.
         const current = await accounts.getAccount(label);
         if (!current) throw new Error(`Account "${label}" is not enrolled`);
-        if (isFresh(current.oauth, clock())) return current.oauth;
+        if (isFresh(current.oauth, clock()) && current.oauth.access !== rejectedAccess) return current.oauth;
 
         const fresh = await refreshFn(current.oauth.refresh);
 
         // Journal BEFORE committing: the server has already invalidated the
         // old refresh token, so these are now the only usable credentials.
-        writeJournal({ label, tokens: fresh, writtenAt: clock() });
+        try {
+          writeJournal({ label, tokens: fresh, writtenAt: clock(), replaces: current.oauth.refresh });
+        } catch (err) {
+          // Commit anyway: skipping the store write would drop the only valid tokens.
+          console.error(
+            `[claude-pool] failed to journal refresh for "${label}": ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
         await accounts.updateTokens(label, fresh);
         clearJournal();
 
@@ -310,9 +355,23 @@ export function createRotationManager(opts: ManagerOptions) {
     }
   }
 
-  /** Mirror an account's tokens into opencode's single anthropic slot. */
+  /**
+   * Mirror an account's tokens into opencode's single anthropic slot.
+   *
+   * Best effort: auth.json is only a derived cache of the pool, so a failed
+   * write must not fail a request that already holds a valid token.
+   */
   async function mirror(record: AccountRecord): Promise<void> {
-    await mirrorFn(record.oauth);
+    try {
+      await mirrorFn(record.oauth);
+    } catch (err) {
+      let detail = err instanceof Error ? err.message : String(err);
+      // The write carried the tokens; keep them out of the log if the error echoes them.
+      for (const secret of [record.oauth.access, record.oauth.refresh]) {
+        if (secret) detail = detail.replaceAll(secret, "[redacted]");
+      }
+      console.error(`[claude-pool] could not mirror "${record.label}" into auth.json: ${detail}`);
+    }
   }
 
   /**
@@ -504,8 +563,8 @@ export function createRotationManager(opts: ManagerOptions) {
       return classify(input);
     },
 
-    async markSuccess(label: string): Promise<void> {
-      await state.markSuccess(label);
+    async markSuccess(label: string, sentAt: number): Promise<void> {
+      await state.markSuccess(label, sentAt);
     },
 
     async exhaustionInfo(): Promise<ExhaustionInfo> {

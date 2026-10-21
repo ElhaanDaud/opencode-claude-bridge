@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { LabelConflictError } from "./enroll.js";
-import { clipFrame, createPoolTui } from "./tui.js";
+import { clipFrame, createPoolTui, findRedundant } from "./tui.js";
 import type { TuiDeps } from "./tui.js";
 import type { PoolSnapshot, PoolSnapshotRow } from "./manager.js";
 
@@ -88,6 +88,51 @@ describe("pool TUI selection", () => {
     await tui.onKey("y");
 
     assert.deepEqual(calls, ["keychain:a", "state:a"]);
+  });
+});
+
+describe("pool TUI prune", () => {
+  const mine = (label: string, status: PoolSnapshotRow["status"], active = false): PoolSnapshotRow => ({
+    ...row(label, status),
+    email: "me@example.com",
+    active,
+  });
+
+  it("keeps the healthy re-login when the dead entry is still the active one", () => {
+    // markDisabled leaves activeLabel pointing at the dead entry.
+    assert.deepEqual([...findRedundant([mine("me-2", "ready"), mine("me", "disabled", true)])], ["me"]);
+    assert.deepEqual([...findRedundant([mine("me-2", "ready"), mine("me", "cooling", true)])], ["me"]);
+  });
+
+  it("uses the active entry only to break a tie between equally healthy siblings", () => {
+    assert.deepEqual([...findRedundant([mine("me", "ready"), mine("me-2", "ready", true)])], ["me"]);
+    assert.deepEqual([...findRedundant([mine("me", "disabled"), mine("me-2", "disabled", true)])], ["me"]);
+  });
+
+  it("prunes the dead entry, never its healthy sibling", async () => {
+    const removed: string[] = [];
+    const accounts = [mine("me-2", "ready"), mine("me", "disabled", true)];
+    const tui = createPoolTui({
+      pool: {
+        snapshot: async () => ({ activeLabel: "me", now: 0, accounts }),
+        pendingRefreshLabel: () => null,
+      } as unknown as TuiDeps["pool"],
+      accounts: {
+        removeAccount: async (label: string) => {
+          removed.push(label);
+        },
+      } as unknown as TuiDeps["accounts"],
+      state: { forget: async () => undefined } as unknown as TuiDeps["state"],
+      enroll: async () => "",
+      stdout: { columns: 100, rows: 30, write: () => true, on: () => undefined } as unknown as NodeJS.WriteStream,
+      stdin: {} as NodeJS.ReadStream,
+    });
+
+    await tui.reload();
+    await tui.onKey("p");
+    await tui.onKey("y");
+
+    assert.deepEqual(removed, ["me"]);
   });
 });
 
@@ -225,6 +270,61 @@ describe("pool TUI enroll", () => {
 
     assert.equal(afterRestore.length, 1);
     assert.match(afterRestore[0]!, /finishing the current action/);
+  });
+});
+
+describe("pool TUI key decoding", () => {
+  /** Start the TUI on a fake TTY and feed it stdin chunks, one read each. */
+  async function feed(chunks: string[]): Promise<{ activated: string[]; quit: boolean }> {
+    const { EventEmitter } = await import("node:events");
+    const stdin = Object.assign(new EventEmitter(), {
+      isTTY: true, setRawMode: () => undefined, resume: () => undefined, pause: () => undefined, setEncoding: () => undefined,
+    });
+    const stdout = Object.assign(new EventEmitter(), { isTTY: true, columns: 100, rows: 30, write: () => true });
+    const activated: string[] = [];
+    const tui = createPoolTui({
+      pool: {
+        snapshot: async () => ({ activeLabel: null, now: 0, accounts: [row("a", "ready"), row("b", "ready")] }),
+        pendingRefreshLabel: () => null,
+      } as unknown as TuiDeps["pool"],
+      accounts: {} as TuiDeps["accounts"],
+      state: {
+        setActive: async (label: string | null) => {
+          if (label) activated.push(label);
+        },
+      } as unknown as TuiDeps["state"],
+      enroll: async () => "",
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+    });
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+    let quit = false;
+    const started = tui.start().then(() => {
+      quit = true;
+    });
+    await tick();
+    for (const chunk of chunks) {
+      stdin.emit("data", chunk);
+      await tick();
+    }
+    const quitByKeys = quit;
+    // A frozen TUI must fail the assertion, not hang the run on its timer.
+    tui.stop();
+    await started;
+    return { activated, quit: quitByKeys };
+  }
+
+  it("keeps reading keys after a bare Esc or an Alt+key", async () => {
+    const result = await feed(["\u001b", "j", "\u001bz", "a", "\u0003"]);
+
+    assert.deepEqual(result, { activated: ["b"], quit: true });
+  });
+
+  it("reads SS3 arrows and escape sequences split across reads", async () => {
+    const result = await feed(["\u001bOB", "a", "\u001b[", "A", "a", "q"]);
+
+    assert.deepEqual(result, { activated: ["b", "a"], quit: true });
   });
 });
 

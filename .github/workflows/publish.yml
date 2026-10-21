@@ -8,6 +8,8 @@ on:
 
 jobs:
   publish:
+    # The npm package belongs to upstream; forks must not publish under its name.
+    if: github.repository == 'dotCipher/opencode-claude-bridge'
     runs-on: ubuntu-latest
     permissions:
       contents: write

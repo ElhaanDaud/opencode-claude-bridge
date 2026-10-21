@@ -356,6 +356,11 @@ export function createAccountStore(backend: SecretBackend) {
       await backend.remove(label);
     },
 
+    /** Enrolled labels, readable or not: a locked keychain lists items it cannot read. */
+    async listLabels(): Promise<string[]> {
+      return backend.list();
+    },
+
     async listAccounts(): Promise<AccountRecord[]> {
       const accounts: AccountRecord[] = [];
       for (const label of await backend.list()) {

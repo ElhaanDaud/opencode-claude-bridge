@@ -46,6 +46,15 @@ describe("classify", () => {
     assert.equal(decision.until, NOW + 61_000);
   });
 
+  it("rotates instead of retrying once the wait would overrun the request's budget", () => {
+    const within = classify(input({ headers: { "retry-after": "30" }, waitBudgetMs: 30_000 }));
+    const over = classify(input({ headers: { "retry-after": "30" }, waitBudgetMs: 29_999 }));
+
+    assert.equal(within.action, "RETRY_SAME");
+    assert.equal(over.action, "ROTATE_COOLDOWN");
+    assert.equal(over.until, NOW + 30_000);
+  });
+
   it("uses an RFC 3339 unified reset header", () => {
     const decision = classify(
       input({
@@ -136,6 +145,12 @@ describe("classify", () => {
     assert.equal(first.source, "status");
     assert.equal(exhausted.action, "PASS_THROUGH");
     assert.equal(exhausted.source, "status");
+  });
+
+  it("passes a 529 through once its backoff would overrun the request's budget", () => {
+    const decision = classify(input({ status: 529, attempt: 1, waitBudgetMs: 1_999 }));
+
+    assert.equal(decision.action, "PASS_THROUGH");
   });
 
   it("does not throw on malformed headers and malformed JSON", () => {

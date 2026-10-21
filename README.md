@@ -7,6 +7,24 @@ Use your Claude Pro/Max subscription in [OpenCode](https://opencode.ai). If you'
 This fork is installed from source. The `opencode-claude-bridge` package on
 npm is the upstream project and does not include the account pool.
 
+### Install with AI
+
+Copy this one line into your AI coding agent (OpenCode, Claude Code, Cursor and so on):
+
+```
+Follow the instructions at https://raw.githubusercontent.com/ElhaanDaud/opencode-claude-pool/main/INSTALL-AI.md to install opencode-claude-pool on this machine.
+```
+
+The agent checks your OpenCode version and installs the matching build: `main`
+for OpenCode 1, `feat/opencode-2` for OpenCode 2. It edits your OpenCode config
+in place after backing it up. Logging accounts in (`claude login`) stays with
+you, because each login is interactive. The full instructions it follows are in
+[INSTALL-AI.md](INSTALL-AI.md).
+
+### OpenCode 1 (manual)
+
+Check your version with `opencode --version`. For `1.x`:
+
 **1. Clone and build**
 
 ```bash
@@ -44,11 +62,24 @@ cd ~/src/opencode-claude-bridge && git pull && npm ci && npm run build
 
 Then restart OpenCode. Full walkthrough, Linux notes and troubleshooting: [SETUP.md](SETUP.md).
 
-### OpenCode 2
+### OpenCode 2 (manual)
 
-OpenCode 2 has a new plugin API, so it loads a separate entrypoint from the
-same build. Point `plugins` (plural, V2's key) at the `dist/opencode2`
-directory; no wrapper is needed:
+OpenCode 2 has a new plugin API and cannot load the V1 plugin. Its support
+lives on the `feat/opencode-2` branch for now. For `opencode --version` `2.x`:
+
+**1. Clone the V2 branch and build**
+
+```bash
+git clone -b feat/opencode-2 https://github.com/ElhaanDaud/opencode-claude-pool.git ~/src/opencode-claude-bridge
+cd ~/src/opencode-claude-bridge && npm ci && npm run build
+```
+
+If you already have a checkout of `main`, switch it instead:
+`git checkout feat/opencode-2 && git pull && npm ci && npm run build`.
+
+**2. Register the build directory** in `~/.config/opencode/opencode.json`. V2
+uses the `plugins` key (plural) and only loads a local plugin from a directory,
+so no wrapper is needed:
 
 ```json
 {
@@ -56,15 +87,27 @@ directory; no wrapper is needed:
 }
 ```
 
+V1 and V2 read the same config file. Don't keep a V1 `plugin` entry for the
+wrapper there: V2 migrates it and fails to load it.
+
+**3. Restart OpenCode and check** that `opencode plugin list` shows
+`opencode-claude-bridge` with a source ending in `dist/opencode2/server.js`.
+
 On V2 the bridge rewrites each Anthropic request in V2's `http.request` hook
 (bearer, Claude Code headers, billing block, system prompt, thinking fields)
-and rotates accounts in `http.response`. Current differences from V1:
+and rotates accounts in `http.response`.
+
+Enrollment, `claude-pool` and the pool itself are shared with V1, so
+[Multi-account rotation](#multi-account-rotation) applies unchanged. What
+differs on V2:
 
 - Tool schemas are sent as V2 defines them. The Claude Code tool mapping is not applied yet.
 - Pool events are logged rather than shown as toasts, since V2's plugin API has no toast call.
+- Without enrolled accounts it uses the Claude CLI login as-is and never refreshes it. Run `claude` to refresh it, or enroll the account.
 - V2 has no `auth.json` slot, so nothing is mirrored there. The pool injects the token per request.
-- Without enrolled accounts it uses the Claude CLI login as-is and never refreshes it, because V2 gives it nowhere to persist a rotated refresh token. Run `claude` to refresh it, or enroll the account.
-- A credential you configure in V2 itself (an Anthropic API key) takes precedence, and the bridge leaves those requests alone.
+- An Anthropic API key you configure in V2 itself takes precedence, and the bridge leaves those requests alone.
+
+**Upgrade:** `cd ~/src/opencode-claude-bridge && git pull && npm ci && npm run build`, then restart OpenCode.
 
 ## How the bridge works
 
@@ -95,9 +138,10 @@ Claude Code sends 26 captured core tools (plus user-specific MCP tools). OpenCod
 
 The bridge resolves this by:
 
-1. **Replacing OpenCode's tool definitions only for Claude-compatible targets** with Claude Code's exact wire-captured definitions — matching descriptions, JSON schemas, parameter names, and required fields.
-2. **Adding 16 Claude-only stub tools**: `AskUserQuestion`, `CronCreate`, `CronDelete`, `CronList`, `EnterPlanMode`, `EnterWorktree`, `ExitPlanMode`, `ExitWorktree`, `Monitor`, `NotebookEdit`, `PushNotification`, `RemoteTrigger`, `ScheduleWakeup`, `TaskOutput`, `TaskStop`, `WebSearch`.
-3. **Sorting all 26 tools alphabetically** to match Claude Code's ordering.
+1. **Replacing active OpenCode shared core tool definitions only for Claude-compatible targets** with Claude Code's exact wire-captured definitions — matching descriptions, JSON schemas, parameter names, and required fields.
+2. **Preserving active OpenCode custom/MCP tool definitions** so project-specific MCP servers remain available to Claude models.
+3. **Selecting Claude-only alias/stub schemas only when the matching OpenCode tool is active** (for example `question` → `AskUserQuestion`, `plan_enter` → `EnterPlanMode`).
+4. **Ordering Claude core tools first, then custom/MCP tools**, each group alphabetical, to match Claude Code's ordering and keep the request prefix byte-stable for prompt caching.
 
 Three of the stubs have OpenCode equivalents and are routed to them: `AskUserQuestion` -> `question`, `EnterPlanMode` -> `plan_enter`, `ExitPlanMode` -> `plan_exit`. If the model calls any other stub, OpenCode's built-in error handling catches it and tells the model the tool is unavailable, and the model adapts on the next turn.
 
@@ -166,6 +210,7 @@ The bridge ships a fallback catalog, used only for model IDs that OpenCode's own
 - **Sonnet 5.5** rejects both `{type:"enabled", budget_tokens}` and `{type:"disabled"}`. `enabled` is rewritten to `adaptive`.
 - **Haiku 5.5** rejects `{type:"enabled"}`, which is rewritten to `adaptive`.
 - `temperature` is forced to `1` whenever thinking is enabled or adaptive, which the API requires.
+- A forced `tool_choice` (`any`, or a named `tool`) can't be combined with thinking, so the forced tool wins: no thinking is injected, and the caller's `enabled` or `adaptive` thinking becomes `disabled`. A named tool is renamed to its Claude Code name. Sonnet 5.5 can't turn thinking off, so it drops a forced `tool_choice` instead and keeps thinking; `auto` and `none` still pass through.
 
 ### Dynamic fingerprint computation
 
@@ -219,15 +264,17 @@ node scripts/claude-pool.mjs install-hook >> ~/.zshrc && source ~/.zshrc
 ```
 
 Accounts are matched by refresh token, then by email, so re-logging into a
-pooled account refreshes its entry instead of duplicating it. Set
-`CLAUDE_POOL_AUTO_ENROLL=0` to disable.
+pooled account never duplicates it. A healthy entry keeps its own tokens, since
+sharing one login with the Claude CLI logs one side out; an entry that rotation
+has disabled, for example after its refresh was rejected, is repaired from the
+newer login and re-enabled. Set `CLAUDE_POOL_AUTO_ENROLL=0` to disable.
 
 ### Commands
 
 | Command | Purpose |
 | --- | --- |
 | `claude-pool enroll [label] [--replace]` | Add the account Claude CLI is logged into |
-| `claude-pool auto` | Enroll the logged-in account only if the pool has not seen it |
+| `claude-pool auto` | Enroll the logged-in account if the pool has not seen it, or repair its disabled entry from a newer login. Does nothing while the pool is empty |
 | `claude-pool install-hook` | Print a shell function that runs `auto` after `claude login` |
 | `claude-pool whoami` | Show which account Claude CLI is logged into, and whether it is pooled |
 | `claude-pool status` | Active account and what rotation would pick next |
@@ -254,7 +301,7 @@ Every failed response is classified before the response body is read:
 
 | Signal | Action |
 | --- | --- |
-| `429` with a reset of 60s or less | Back off, retry the **same** account (up to 3 attempts, then rotate) |
+| `429` with a reset of 60s or less | Back off, retry the **same** account (up to 3 attempts within the wait budget below, then rotate) |
 | `429` with a longer reset, or `anthropic-ratelimit-unified-status` not `allowed` | Cool the account down until its reset, switch accounts |
 | `429` with no determinable reset | Cool down for 1 hour, switch |
 | `403` whose body says suspended / disabled / banned | Disable the account, switch |
@@ -262,6 +309,12 @@ Every failed response is classified before the response body is read:
 | `401` | Credential rejected even after refresh — disable, switch |
 | `5xx` | Retry the same account with exponential backoff (1s, 2s, 4s), then pass through |
 | Every account cooling | Fail fast as `429`, naming each account and the earliest reset |
+
+Retries in place share one 10s wait budget per request, across every account.
+A retry that would overrun it is not slept: a `429` cools the account down until
+its reset and rotates, a `5xx` passes through. A pool answering "retry in 60s"
+everywhere therefore fails fast, and OpenCode's own retry, which shows the wait,
+takes over.
 
 A 401/403 penalty is only applied once **another account succeeds** with the
 same request. If the next account fails identically, the request is blamed and
@@ -297,7 +350,8 @@ old one immediately, with no grace window. Losing the replacement permanently
 locks you out of that account.
 
 Refreshes therefore journal the new tokens to disk before committing them to
-the keychain, and any journal found at startup is replayed. Concurrent
+the keychain, and any journal found at startup is replayed (or renamed aside,
+never deleted, if its account was since removed or re-enrolled). Concurrent
 refreshes of one account collapse into a single call, since two parallel
 refreshes would spend the same token twice. Across processes, refreshes are
 serialised by the rotation lock. A stale lock is reclaimed only once its holder
@@ -314,7 +368,7 @@ CLI's own stored copy of that credential is stale.** That is expected. Run
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1.2+, or v2 (tested on 2.0.32; see [OpenCode 2](#opencode-2))
+- [OpenCode](https://opencode.ai) v1.2+, or v2 via the `feat/opencode-2` branch (tested on 2.0.32; see [OpenCode 2](#opencode-2-manual))
 - For OAuth: [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in (`claude login`)
 - macOS (Keychain) or Linux (`~/.claude/.credentials.json` fallback)
 - For API key: just configure a `provider` with `apiKey` in your OpenCode config as usual
@@ -362,7 +416,7 @@ The validator will:
 - Query the OAuth usage endpoint before and after each run
 - Capture an official Claude Code request through a local proxy
 - Capture an OpenCode request using this repo's local `dist/index.js`
-- Write Claude Code's captured system prompt to `~/.cache/opencode-claude-bridge/claude-system-prompt.json`
+- Write Claude Code's captured system prompt to `~/.cache/opencode-claude-bridge/claude-system-prompt.json` (or `ANTHROPIC_SYSTEM_PROMPT_PATH`, if set)
 - Save request and response artifacts under `tmp/validate-*`
 - Write a `report.json` with request diffs, body hashes, and usage snapshots
 
@@ -381,7 +435,7 @@ When Claude Code updates, the required headers or body fields may change. To cap
 ./scripts/intercept-claude.sh claude-sonnet-4-6
 ```
 
-This starts a local proxy, runs Claude CLI through it with OAuth, and saves the full request headers and body to `/tmp/claude-intercept-*`. Compare against the plugin's constants and fetch wrapper to spot differences.
+This starts a local proxy, runs Claude CLI through it with OAuth, and saves the request headers (credentials redacted) and body to a private `/tmp/claude-intercept.XXXXXX/` directory. Compare against the plugin's constants and fetch wrapper to spot differences.
 
 Key things that have changed across versions:
 
