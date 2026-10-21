@@ -392,11 +392,12 @@ export async function exchangeCodeForTokens(
   return parseTokenResponse(status, body, "Token exchange");
 }
 
-export async function refreshTokens(refreshToken: string): Promise<OAuthTokens> {
+/** `retries: 1` sends the single-use refresh token once: a retry after a request that reached the server can spend it twice. */
+export async function refreshTokens(refreshToken: string, retries?: number): Promise<OAuthTokens> {
   const { status, body } = await curlPost({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: CLIENT_ID,
-  });
+  }, retries);
   return parseTokenResponse(status, body, "Token refresh");
 }

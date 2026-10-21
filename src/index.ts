@@ -735,16 +735,25 @@ export function stripMessageCacheControlPreservingTail(
 /**
  * Claude Code's captured system prompt leads (billing header first), and
  * OpenCode's own system blocks — agent prompt, AGENTS.md, instructions — follow
- * instead of being discarded.
+ * instead of being discarded. The identity line both carry is kept once.
  */
 export function mergeClaudeSystemPrompt(
   billingHeader: string,
   claudeBlocks: Array<{ type?: string; text?: string }>,
   opencodeBlocks: Array<{ type?: string; text?: string }>,
 ): Array<{ type?: string; text?: string }> {
-  const own = opencodeBlocks.filter(
+  let own = opencodeBlocks.filter(
     (block) => !block.text?.startsWith("x-anthropic-billing-header:"),
   );
+  // Both prompts open with the identity line; send it once.
+  if (claudeBlocks.some((block) => block.text?.includes(CLAUDE_PREFIX))) {
+    const lead = `${CLAUDE_PREFIX}\n\n`;
+    own = own
+      .filter((block) => block.text?.trim() !== CLAUDE_PREFIX)
+      .map((block) =>
+        block.text?.startsWith(lead) ? { ...block, text: block.text.slice(lead.length) } : block,
+      );
+  }
   return [{ type: "text", text: billingHeader }, ...claudeBlocks, ...own];
 }
 

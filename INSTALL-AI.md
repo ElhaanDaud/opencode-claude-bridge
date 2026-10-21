@@ -36,7 +36,7 @@ missing, tell the user to install OpenCode (https://opencode.ai) and stop.
 ## 2. Detect the OpenCode version
 
 Take the first `X.Y.Z` in the `opencode --version` output (V1 prints `1.18.30`,
-V2 prints `opencode v2.0.32`). Its major number picks the build:
+V2 prints `opencode v2.1.2`). Its major number picks the build:
 
 | Major | Branch | Plugin config key | Entry to register |
 | --- | --- | --- | --- |
@@ -157,8 +157,9 @@ terminal) and check that no account shows `needs re-login` or `disabled`.
 
 Ask the user to restart OpenCode, then run:
 
-- OpenCode 2: `opencode plugin list` must show `opencode-claude-bridge` with a
-  source ending in `dist/opencode2/server.js`.
+- OpenCode 2: `opencode run --standalone --print-logs -m anthropic/claude-haiku-4-5-20251001 "Reply with exactly: OK" 2>&1 | grep -c "dist/opencode2/server.js"`
+  must print a number above 0. (`opencode plugin list` doesn't list directory
+  plugins on 2.1.)
 - Both versions:
 
   ```bash

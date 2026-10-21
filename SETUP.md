@@ -118,8 +118,9 @@ plugin, so skip the wrapper and point V2's `plugins` key at the build's
 
 V1 and V2 read the same config locations, so do not keep the V1 `plugin`
 entry in a config V2 loads: V2 migrates it and fails to load the wrapper.
-Confirm the plugin loaded with `opencode plugin list`, which should show
-`opencode-claude-bridge` with source `.../dist/opencode2/server.js`.
+Confirm it loaded: `opencode run --standalone --print-logs -m anthropic/claude-haiku-4-5-20251001 "Reply
+with exactly: OK"` shows a `loading plugin` line for `dist/opencode2/server.js`
+(`opencode plugin list` doesn't list directory plugins on 2.1).
 Enrollment and the pool are shared; everything in §4 onwards applies
 unchanged. See the README's OpenCode 2 section for what differs from V1.
 
