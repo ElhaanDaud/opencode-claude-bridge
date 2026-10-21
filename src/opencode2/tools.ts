@@ -22,7 +22,10 @@ type Json = Record<string, unknown>;
 interface Mapping {
   v2: string;
   claude: string;
-  /** V2 input properties the inbound translation may emit; guards against schema drift. */
+  /**
+   * V2 input properties the inbound translation may emit; guards against schema
+   * drift. `a[].b` is property `b` of the objects in array `a`.
+   */
   produces: readonly string[];
   /** Claude tool input -> V2 tool input. Keys it does not know are dropped: V2 schemas are strict. */
   toV2(input: Json): Json;
@@ -189,7 +192,15 @@ const MAPPINGS: readonly Mapping[] = [
   {
     v2: "question",
     claude: "AskUserQuestion",
-    produces: ["questions"],
+    produces: [
+      "questions",
+      "questions[].question",
+      "questions[].header",
+      "questions[].options",
+      "questions[].multiple",
+      "questions[].options[].label",
+      "questions[].options[].description",
+    ],
     toV2(input) {
       const questions = questionList(input.questions);
       if (!Array.isArray(questions)) return rename(input, { questions: "questions" });
@@ -226,19 +237,31 @@ function toolName(tool: unknown): string | undefined {
   return isRecord(tool) && typeof tool.name === "string" ? tool.name : undefined;
 }
 
-/**
- * True when V2's tool still looks the way the translator assumes: every
- * required V2 property is one the translation can supply, and every property
- * it emits exists. Otherwise the V2 tool is left alone.
- */
-function schemaFits(tool: unknown, mapping: Mapping): boolean {
-  const schema = isRecord(tool) ? tool.input_schema : undefined;
+/** `schemaFits` for one object schema; `paths` are relative to it. */
+function objectFits(schema: unknown, paths: readonly string[]): boolean {
   if (!isRecord(schema) || !isRecord(schema.properties)) return false;
+  const properties = schema.properties;
+  const own = paths.filter((p) => !p.includes("[]."));
   const required = Array.isArray(schema.required) ? schema.required : [];
   return (
-    required.every((key) => typeof key === "string" && mapping.produces.includes(key)) &&
-    mapping.produces.every((key) => key in (schema.properties as Json))
+    required.every((key) => typeof key === "string" && own.includes(key)) &&
+    own.every((key) => {
+      if (!Object.hasOwn(properties, key)) return false;
+      const nested = paths.filter((p) => p.startsWith(`${key}[].`)).map((p) => p.slice(key.length + 3));
+      const property = properties[key];
+      return nested.length === 0 || (isRecord(property) && objectFits(property.items, nested));
+    })
   );
+}
+
+/**
+ * True when V2's tool still looks the way the translator assumes, nested array
+ * items included: every required V2 property is one the translation can
+ * supply, and every property it emits exists. Otherwise the V2 tool is left
+ * alone.
+ */
+function schemaFits(tool: unknown, mapping: Mapping): boolean {
+  return objectFits(isRecord(tool) ? tool.input_schema : undefined, mapping.produces);
 }
 
 function translateInput(mapping: Mapping, direction: "toV2" | "toClaude", input: unknown): unknown {

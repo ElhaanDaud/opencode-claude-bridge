@@ -146,6 +146,20 @@ export function diffPoolSnapshots(
   return events;
 }
 
+/**
+ * A state file that went missing or unusable is replaced by a fresh one, which
+ * the pool fills back in as it syncs. Until then the accounts it lacks are
+ * fresh, not gone: diffed as-is, the first rebuilt file reads as an exhausted
+ * pool and every account re-registered after it as newly added.
+ */
+function carryAccounts(prev: PoolSnapshot, next: PoolSnapshot): PoolSnapshot {
+  const accounts = { ...next.accounts };
+  for (const label of Object.keys(prev.accounts)) {
+    accounts[label] ??= { cooldownUntil: null, disabled: false, lastReason: null };
+  }
+  return { ...next, accounts };
+}
+
 export interface PoolWatcherOptions {
   statePath: string;
   onEvents: (events: PoolEvent[]) => void;
@@ -161,6 +175,8 @@ export function watchPoolState(opts: PoolWatcherOptions): Cleanup {
   const base = path.basename(statePath);
 
   let prev: PoolSnapshot | null = null;
+  // The file was missing or unusable since `prev`, so the pool is rebuilding it.
+  let rebuilding = false;
   let lastSignature = "";
   let stopped = false;
   let debounce: NodeJS.Timeout | undefined;
@@ -172,14 +188,24 @@ export function watchPoolState(opts: PoolWatcherOptions): Cleanup {
       const st = fs.statSync(statePath);
       const signature = `${st.ino}:${st.mtimeMs}:${st.size}`;
       if (signature === lastSignature) return;
-      const next = parsePoolSnapshot(fs.readFileSync(statePath, "utf8"));
+      let next = parsePoolSnapshot(fs.readFileSync(statePath, "utf8"));
       lastSignature = signature;
-      if (!next) return;
+      if (!next) {
+        // The pool moves an unusable file aside and starts afresh.
+        if (prev) rebuilding = true;
+        return;
+      }
+      if (rebuilding && prev) next = carryAccounts(prev, next);
+      rebuilding = false;
       const events = diffPoolSnapshots(prev, next, clock());
-      prev = next;
+      // A rotation clears activeLabel before it picks the next account, and the
+      // pick (keychain reads, a token refresh) can outlast the debounce: keep
+      // diffing against the account last in use.
+      prev = next.activeLabel === null && prev?.activeLabel ? { ...next, activeLabel: prev.activeLabel } : next;
       if (events.length) onEvents(events);
-    } catch {
+    } catch (err) {
       // Missing or unreadable state means no toast; keep the last good snapshot.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT" && prev) rebuilding = true;
     }
   };
 
@@ -199,7 +225,7 @@ export function watchPoolState(opts: PoolWatcherOptions): Cleanup {
     // Directory missing or watching unsupported: polling still covers it.
   }
 
-  const timer = setInterval(check, Math.max(opts.pollMs ?? POLL_MS, POLL_MS));
+  const timer = setInterval(check, Math.max(opts.pollMs ?? POLL_MS, 50));
   timer.unref();
 
   return () => {

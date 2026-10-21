@@ -17,12 +17,14 @@ type TokenReply = { status: number; body: unknown };
 const tokenRequests: Array<Record<string, string>> = [];
 let tokenReply: () => TokenReply = () => ({ status: 200, body: {} });
 let tokenDelayMs = 0;
+// Captured so the server still answers while a test mocks timers.
+const realSetTimeout = globalThis.setTimeout;
 const tokenServer = http.createServer((req, res) => {
   let raw = "";
   req.on("data", (chunk) => (raw += chunk));
   req.on("end", () => {
     tokenRequests.push(JSON.parse(raw) as Record<string, string>);
-    setTimeout(() => {
+    realSetTimeout(() => {
       const reply = tokenReply();
       res.writeHead(reply.status, { "content-type": "application/json" });
       res.end(JSON.stringify(reply.body));
@@ -49,7 +51,7 @@ type V2Credential = import("./server.js").V2Credential;
 type V2OAuthCredential = import("./server.js").V2OAuthCredential;
 type V2IntegrationEditor = import("./server.js").V2IntegrationEditor;
 
-type Reply = { status: number; body: string; headers?: Record<string, string> };
+type Reply = { status: number; body: string; headers?: Record<string, string>; reject?: boolean };
 
 const realFetch = globalThis.fetch;
 const realHome = process.env.HOME;
@@ -134,8 +136,9 @@ async function load(opts: LoadOptions = {}) {
     if (!String(url).includes("/v1/messages")) return new Response("{}", { status: 404 });
     const request = new Request(url, init);
     sent.push(request);
-    const label = String(request.headers.get("authorization")).replace("Bearer access-", "");
+    const label = request.headers.get("authorization")?.replace("Bearer access-", "") ?? "none";
     const reply = replies[label] ?? { status: 401, body: "{}" };
+    if (reply.reject) throw new TypeError("fetch failed");
     return new Response(reply.body, { status: reply.status, headers: reply.headers });
   }) as typeof fetch;
 
@@ -187,6 +190,8 @@ interface ThroughOptions {
   sessionID?: string;
   kind?: string;
   providerID?: string;
+  method?: string;
+  url?: string;
   headers?: Record<string, string>;
   body?: unknown;
   /** What another plugin running after ours might do to the request. */
@@ -198,14 +203,15 @@ async function through(loaded: Loaded, opts: ThroughOptions = {}) {
   const model = { providerID: opts.providerID ?? "anthropic" };
   const sessionID = opts.sessionID ?? "ses_1";
   const kind = opts.kind ?? "primary";
+  const method = opts.method ?? "POST";
   const before: V2HttpRequestEvent = {
     sessionID,
     kind,
     model,
-    request: new Request("https://api.anthropic.com/v1/messages", {
-      method: "POST",
+    request: new Request(opts.url ?? "https://api.anthropic.com/v1/messages", {
+      method,
       headers: { "content-type": "application/json", ...opts.headers },
-      body: JSON.stringify(
+      body: method === "GET" ? undefined : JSON.stringify(
         opts.body ?? {
           model: "claude-haiku-4-5-20251001",
           system: [{ type: "text", text: "You are OpenCode." }],
@@ -332,6 +338,52 @@ describe("OpenCode 2 entrypoint", () => {
 
     assert.equal(request.headers.get("authorization"), null);
     assert.equal(new URL(request.url).searchParams.get("beta"), null);
+  });
+
+  it("drops V2's own session headers, which Claude Code never sends", async () => {
+    await enroll(["alice"]);
+    const { request } = await send({
+      replies: { alice: OK },
+      headers: {
+        "x-opencode-session-id": "ses_1",
+        "x-opencode-parent-session-id": "ses_0",
+        "x-parent-session-id": "ses_0",
+        "x-opencode-project": "project-hash",
+        "x-opencode-session": "ses_1",
+        "x-opencode-client": "cli",
+      },
+    });
+
+    const leaked: string[] = [];
+    request.headers.forEach((_, name) => {
+      if (name.startsWith("x-opencode-") || name === "x-parent-session-id") leaked.push(name);
+    });
+    assert.deepEqual(leaked, []);
+  });
+
+  it("authenticates a GET without giving it a body", async () => {
+    await enroll(["alice"]);
+    const { request } = await send({ replies: { alice: OK }, method: "GET", url: "https://api.anthropic.com/v1/models" });
+
+    assert.equal(request.method, "GET");
+    assert.equal(request.body, null);
+    assert.equal(request.headers.get("authorization"), "Bearer access-alice");
+  });
+
+  it("only authenticates count_tokens: its body is left alone and a 429 is not rotated", async () => {
+    await enroll(["alice", "bob"]);
+    const body = { model: "claude-haiku-4-5-20251001", messages: [{ role: "user", content: "hello" }] };
+    const { request, response, sent } = await send({
+      replies: { alice: RATE_LIMITED, bob: OK },
+      url: "https://api.anthropic.com/v1/messages/count_tokens",
+      body,
+    });
+
+    assert.equal(request.headers.get("authorization"), "Bearer access-alice");
+    assert.deepEqual(JSON.parse(await request.text()), body);
+    assert.equal(response.status, 429);
+    assert.equal(sent.length, 1);
+    assert.equal(accountState("alice")?.cooldownUntil ?? 0, 0);
   });
 });
 
@@ -539,6 +591,17 @@ describe("token refresh", () => {
     assert.equal(tokenRequests.length, 1);
   });
 
+  it("still answers the spent token long after the refresh, since V2 may have failed to store the new pair", async () => {
+    tokenReply = () => ({ status: 200, body: { access_token: "fresh", refresh_token: "fresh-r", expires_in: 3600 } });
+    const { method } = await load();
+    mock.timers.enable({ apis: ["setTimeout"] });
+    await method.refresh!(stale());
+    mock.timers.tick(60 * 60_000);
+
+    assert.equal((await method.refresh!(stale())).refresh, "fresh-r");
+    assert.equal(tokenRequests.length, 1);
+  });
+
   it("sends a failing refresh once: a retried single-use token can only be rejected", async () => {
     tokenReply = () => ({ status: 503, body: { error: { message: "unavailable" } } });
     const { method } = await load();
@@ -625,6 +688,67 @@ describe("credential order without a pool", () => {
     assert.equal(request.headers.get("authorization"), null);
   });
 
+  it("answers an expired Claude CLI login with a 401 that says what to do, without sending it", async () => {
+    writeClaudeLogin("cli-access", Date.now() - 1000);
+    const { request, response, sent } = await send({ replies: {} });
+
+    assert.ok(request.url.startsWith("data:"));
+    assert.equal(sent.length, 0);
+    assert.equal(response.status, 401);
+    const body = (await response.json()) as { error: { type: string; message: string } };
+    assert.equal(body.error.type, "authentication_error");
+    assert.match(body.error.message, /claude-pool enroll/);
+  });
+
+  it("warns again when the Claude CLI login expires after having recovered", async () => {
+    const errors = mock.method(console, "error", () => undefined);
+    const warnings = () => errors.mock.calls.filter((call) => /no fresh Claude CLI login/i.test(String(call.arguments[0]))).length;
+    const loaded = await load({ replies: { "cli-access": OK } });
+    writeClaudeLogin("cli-access", Date.now() - 1000);
+    await through(loaded);
+    await through(loaded);
+    writeClaudeLogin("cli-access");
+    await through(loaded);
+    writeClaudeLogin("cli-access", Date.now() - 1000);
+    await through(loaded);
+    errors.mock.restore();
+
+    assert.equal(warnings(), 2);
+  });
+
+  // V2 imports OpenCode 1's auth.json on first start: the bridge's V1 login
+  // becomes an OAuth credential of method "oauth" that V2 attaches as a bearer.
+  const imported: V2OAuthCredential = {
+    type: "oauth",
+    methodID: "oauth",
+    access: "v1-access",
+    refresh: "v1-refresh",
+    expires: Date.now() + 3_600_000,
+  };
+  const importedRequest = { connection: OWN_CONNECTION, credential: imported, headers: { authorization: "Bearer v1-access" } };
+
+  it("does not mistake V2's import of the OpenCode 1 login for a user credential", async () => {
+    await enroll(["alice"]);
+    const { request } = await send({ replies: { alice: OK }, ...importedRequest });
+
+    assert.equal(request.headers.get("authorization"), "Bearer access-alice");
+  });
+
+  it("uses the Claude CLI login rather than the imported OpenCode 1 login", async () => {
+    writeClaudeLogin("cli-access");
+    const { request } = await send({ replies: {}, ...importedRequest });
+
+    assert.equal(request.headers.get("authorization"), "Bearer cli-access");
+    assert.equal(tokenRequests.length, 0);
+  });
+
+  it("answers 401 rather than send the imported OpenCode 1 login unshaped", async () => {
+    const { response, sent } = await send({ replies: {}, ...importedRequest });
+
+    assert.equal(sent.length, 0);
+    assert.equal(response.status, 401);
+  });
+
   it("lets the pool win over the connection when accounts are enrolled", async () => {
     await enroll(["alice"]);
     const credential = ownCredential("own-access");
@@ -689,6 +813,33 @@ describe("exhausted pool and busy lock", () => {
     assert.equal(response.headers.get("retry-after"), "5");
     const body = (await response.json()) as Record<string, unknown>;
     assert.equal(body.claude_pool_exhausted, undefined);
+  });
+});
+
+describe("rotation", () => {
+  it("passes the original error through when the rotation resend fails", async () => {
+    await enroll(["alice", "bob"]);
+    const { response } = await send({ replies: { alice: RATE_LIMITED, bob: { status: 0, body: "", reject: true } } });
+
+    assert.equal(response.status, 429);
+    const body = (await response.json()) as { error: { type: string } };
+    assert.equal(body.error.type, "rate_limit_error");
+  });
+
+  it("marks the pool's 429 when rotation runs out of accounts, so V2 does not retry it", async () => {
+    await enroll(["alice", "bob"]);
+    const loaded = await load({ replies: { alice: RATE_LIMITED, bob: RATE_LIMITED } });
+    const { response } = await through(loaded);
+    assert.equal(response.status, 429);
+    const event: V2RetryEvent = {
+      model: { providerID: "anthropic" },
+      error: { type: "provider.rate-limit", message: "x", status: 429, response: { body: await response.text() } },
+      attempt: 1,
+      decision: { retry: true, delay: 900_000 },
+    };
+    await loaded.hooks.retry!(event);
+
+    assert.deepEqual(event.decision, { retry: false });
   });
 });
 
@@ -823,6 +974,23 @@ describe("request/response correlation", () => {
     ]);
 
     assert.deepEqual(results.map((r) => r.response.status), [200, 200, 200]);
+  });
+
+  it("does not hand an unanswered request's entry to a later one left untouched", async () => {
+    await enroll(["alice", "bob"]);
+    const loaded = await load({ replies: { alice: RATE_LIMITED, bob: OK, none: RATE_LIMITED } });
+    // V2 gives hooks no abort signal, so a request cancelled or failed in
+    // transport leaves its entry behind.
+    await loaded.hooks.request!({
+      sessionID: "ses_1",
+      kind: "primary",
+      model: { providerID: "anthropic" },
+      request: new Request("https://api.anthropic.com/v1/messages", { method: "POST", body: "{}" }),
+    });
+    const { response } = await through(loaded, { headers: { "x-api-key": "sk-ant-user" } });
+
+    assert.equal(response.status, 429);
+    assert.equal(loaded.sent.length, 1);
   });
 
   it("does not hand a stale entry to a later request that was not rewritten", async () => {

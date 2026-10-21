@@ -88,7 +88,8 @@ test("watchPoolState: missing file is silent, later changes are reported, cleanu
     fs.renameSync(`${file}.tmp`, file);
   };
   const seen: string[] = [];
-  const stop = watchPoolState({ statePath: file, onEvents: (e) => seen.push(...e.map((x) => x.message)) });
+  // Fast polling, so a change fs.watch reports late still lands inside each wait.
+  const stop = watchPoolState({ statePath: file, pollMs: 100, onEvents: (e) => seen.push(...e.map((x) => x.message)) });
   try {
     write({ activeLabel: "a", accounts: { a: {}, b: {} } });
     await new Promise((r) => setTimeout(r, 400));
@@ -100,6 +101,65 @@ test("watchPoolState: missing file is silent, later changes are reported, cleanu
   } finally {
     stop();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** A watcher on a fresh state file; `write` replaces it atomically, as the pool does. */
+function watched() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ocb-tui-"));
+  const file = path.join(dir, "state.json");
+  const seen: string[] = [];
+  const stop = watchPoolState({ statePath: file, pollMs: 100, onEvents: (e) => seen.push(...e.map((x) => x.message)) });
+  return {
+    file,
+    seen,
+    write(state: object) {
+      fs.writeFileSync(`${file}.tmp`, JSON.stringify(state));
+      fs.renameSync(`${file}.tmp`, file);
+    },
+    settle: () => new Promise((r) => setTimeout(r, 400)),
+    done() {
+      stop();
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+test("watchPoolState: a rotation that releases the active account before the next pick still reports the switch", async () => {
+  const w = watched();
+  try {
+    const later = Date.now() + 3600e3;
+    w.write({ activeLabel: "a", accounts: { a: {}, b: {} } });
+    await w.settle();
+    // applyDecision cools "a" and clears activeLabel; acquire then takes a while to pick "b".
+    w.write({ activeLabel: null, accounts: { a: { cooldownUntil: later }, b: {} } });
+    await w.settle();
+    w.write({ activeLabel: "b", accounts: { a: { cooldownUntil: later }, b: {} } });
+    await w.settle();
+    assert.deepEqual(w.seen, ['Switched from "a" to "b"']);
+  } finally {
+    w.done();
+  }
+});
+
+test("watchPoolState: a state file rebuilt after being moved aside is not an exhausted pool or new accounts", async () => {
+  const w = watched();
+  try {
+    w.write({ activeLabel: "a", accounts: { a: {}, b: {}, c: {} } });
+    await w.settle();
+    fs.writeFileSync(w.file, "{corrupt");
+    await w.settle();
+    // The next locked write moves it aside and saves only what it touched...
+    fs.renameSync(w.file, `${w.file}.corrupt-1`);
+    await w.settle();
+    w.write({ activeLabel: null, accounts: { a: { cooldownUntil: Date.now() + 3600e3 } } });
+    await w.settle();
+    // ...and the next sync registers the other accounts again.
+    w.write({ activeLabel: null, accounts: { a: { cooldownUntil: Date.now() + 3600e3 }, b: {}, c: {} } });
+    await w.settle();
+    assert.deepEqual(w.seen, []);
+  } finally {
+    w.done();
   }
 });
 

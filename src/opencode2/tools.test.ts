@@ -28,14 +28,36 @@ const V2_SCHEMAS: Record<string, { props: string[]; required: string[] }> = {
   alpha_mcp: { props: ["y"], required: [] },
 };
 
+// The question tool's items, which the translation reaches into.
+const questionItems = (): Json => ({
+  type: "object",
+  properties: {
+    question: { type: "string" },
+    header: { type: "string" },
+    options: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { label: { type: "string" }, description: { type: "string" } },
+        required: ["label", "description"],
+        additionalProperties: false,
+      },
+    },
+    multiple: { type: "boolean" },
+  },
+  required: ["question", "header", "options"],
+  additionalProperties: false,
+});
+
 function v2Tool(name: string): Json {
   const { props, required } = V2_SCHEMAS[name]!;
+  const property = (p: string) => (name === "question" ? { type: "array", items: questionItems() } : { type: "string" });
   return {
     name,
     description: `v2 ${name}`,
     input_schema: {
       type: "object",
-      properties: Object.fromEntries(props.map((p) => [p, { type: "string" }])),
+      properties: Object.fromEntries(props.map((p) => [p, property(p)])),
       required,
       additionalProperties: false,
     },
@@ -101,6 +123,22 @@ describe("applyClaudeToolsForV2 tool definitions", () => {
     const tools = JSON.parse(out.body).tools;
     assert.deepEqual(tools.map((t: Json) => t.name), ["Write", "read"]);
     assert.deepEqual(out.inboundToolNameMap, { Write: "write" });
+  });
+
+  it("leaves question alone when its question or option items no longer fit", () => {
+    const drifts: Array<(items: Json) => void> = [
+      (items) => { items.properties.id = { type: "string" }; items.required.push("id"); },
+      (items) => { items.properties.multiSelect = items.properties.multiple; delete items.properties.multiple; },
+      (items) => { items.properties.options.items.required.push("value"); },
+      (items) => { delete items.properties.options.items; },
+    ];
+    for (const drift of drifts) {
+      const question = v2Tool("question");
+      drift(question.input_schema.properties.questions.items);
+      const out = applyClaudeToolsForV2(JSON.stringify({ tools: [question, v2Tool("read")] }));
+      assert.deepEqual(JSON.parse(out.body).tools.map((t: Json) => t.name), ["Read", "question"]);
+      assert.deepEqual(out.inboundToolNameMap, { Read: "read" });
+    }
   });
 
   it("returns the body untouched when nothing maps, on bad JSON, and on a name collision", () => {

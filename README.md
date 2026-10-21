@@ -100,10 +100,14 @@ On 2.1, `opencode plugin list` doesn't list directory plugins; `opencode run
 (`opencode auth login anthropic --method claude-pro-max`, a browser sign-in
 that V2 stores and refreshes); then the Claude CLI login, read-only and never
 refreshed. The V2 login is its own token chain, so refreshing it never logs
-Claude Code out. An Anthropic API key you configure in V2 takes precedence and
-is left alone. With enrolled accounts or a Claude CLI login, the bridge turns
-V2's anthropic provider on itself, so no key is needed; restart OpenCode after
-enrolling the first account.
+Claude Code out. V2 also imports OpenCode 1's login on first start; the bridge
+never uses that copy, since nothing in V2 refreshes it and its refresh token is
+still OpenCode 1's. When the Claude CLI login has expired and nothing else is
+available, the request isn't sent and OpenCode shows how to log in again. An
+Anthropic API key you configure in V2 takes precedence and is left alone. With
+enrolled accounts or a Claude CLI login, the bridge turns V2's anthropic
+provider on itself, so no key is needed; restart OpenCode after enrolling the
+first account.
 
 Enrollment, `claude-pool` and the pool itself are shared with V1, so
 [Multi-account rotation](#multi-account-rotation) applies unchanged. The
@@ -117,7 +121,8 @@ on V1, through V2's `http.request` and `http.response` hooks. What differs:
 - Pool toasts come from a separate TUI entry that watches the rotation state
   file, so a TUI attached to a remote server doesn't show them.
 - When every account is cooling, the request isn't sent: OpenCode shows the
-  pool's message and doesn't retry.
+  pool's message and doesn't retry. Rotation that runs out of accounts
+  mid-request ends the same way.
 - V2 has no `auth.json`, so nothing is mirrored there.
 
 **Upgrade:** `cd ~/src/opencode-claude-bridge && git pull && npm ci && npm run build`, then restart OpenCode.

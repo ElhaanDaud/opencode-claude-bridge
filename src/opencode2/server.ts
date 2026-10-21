@@ -10,6 +10,8 @@
  * Credentials, in order: the pool, the connection created by this plugin's
  * "Claude Pro / Max (OAuth)" login (V2 stores and refreshes it), then the
  * Claude CLI login read-only. A key or token the user configured is left alone.
+ * Only message requests are reshaped and rotated; anything else sent to
+ * Anthropic (count_tokens, a GET) is only authenticated.
  */
 
 import { randomUUID } from "node:crypto";
@@ -38,9 +40,11 @@ const EXPIRY_BUFFER_MS = 60_000;
 const V1_PLACEHOLDER_KEY = "oauth-placeholder";
 /** Marks the synthetic 429 so the `retry` hook can tell it from a real Anthropic rate limit. */
 const POOL_EXHAUSTED_FIELD = "claude_pool_exhausted";
-/** A successful refresh stays available to callers still holding the spent token. */
-const REFRESH_RETENTION_MS = 60_000;
 const PENDING_MAX_AGE_MS = 10 * 60_000;
+/** Request headers V2 adds for its own gateway; Claude Code sends none of them. */
+const V2_HEADER = /^x-opencode-|^x-parent-session-id$/;
+const NO_CREDENTIAL =
+  "No fresh Claude CLI login and no pooled account; run `claude` once to refresh it, connect with the Claude Pro / Max (OAuth) method, or enroll accounts with `claude-pool enroll`";
 /** Never fetched: a request pointed here fails nowhere near the network and its response is swapped. */
 const INERT_URL = "data:text/plain,claude-pool";
 
@@ -174,13 +178,16 @@ interface PendingEntry {
 
 /**
  * Requests between `http.request` and `http.response`. They are matched by the
- * Request object we handed back; if another plugin replaced it after us, the
- * session and request kind (which both events carry) identify it instead, but
- * only while a single request of that kind is outstanding: with concurrent
- * ones, guessing would feed one request's response to another's rotation.
+ * Request object we handed back (V2 passes the same one to both hooks); if
+ * another plugin replaced it after us, the session and request kind (which
+ * both events carry) identify it instead, but only while a single request of
+ * that kind is outstanding: with concurrent ones, guessing would feed one
+ * request's response to another's rotation.
  */
 class PendingRequests {
   private readonly byKey = new Map<string, PendingEntry[]>();
+  /** Handed back with nothing pending (a user's key, count_tokens): never matched to an entry. */
+  private readonly untracked = new WeakSet<Request>();
 
   add(event: V2HttpRequestEvent, value: Pending): void {
     const key = keyOf(event);
@@ -188,11 +195,18 @@ class PendingRequests {
     const live = (this.byKey.get(key) ?? []).filter((entry) => now - entry.at < PENDING_MAX_AGE_MS);
     const entry: PendingEntry = { request: event.request, value, at: now };
     this.byKey.set(key, [...live, entry]);
-    // A request that never gets a response (cancelled, transport error) would otherwise linger.
+    // A request that never gets a response (cancelled, transport error) would
+    // otherwise linger until PENDING_MAX_AGE_MS. V2 2.1 hands the hook a
+    // request whose signal never aborts, so there it does.
     event.request.signal.addEventListener("abort", () => this.remove(key, entry), { once: true });
   }
 
+  skip(request: Request): void {
+    this.untracked.add(request);
+  }
+
   take(event: V2HttpResponseEvent): Pending | undefined {
+    if (this.untracked.has(event.request)) return undefined;
     const key = keyOf(event);
     const entries = this.byKey.get(key) ?? [];
     const exact = entries.find((entry) => entry.request === event.request);
@@ -233,9 +247,11 @@ function toCredential(tokens: OAuthTokens, metadata?: Record<string, unknown>): 
 
 /**
  * Refresh tokens are single-use, so concurrent callers share one request, and
- * a late caller still holding the spent token gets that result rather than
- * sending it again. The request itself is sent once (`retries: 1`): after one
- * that may have reached the server, a resend can only hit a spent token.
+ * any later caller still holding the spent token gets that result rather than
+ * sending it again. V2 stores the new pair only after this returns, so when
+ * that write fails, this is its only copy. The request itself is sent once
+ * (`retries: 1`): after one that may have reached the server, a resend can
+ * only hit a spent token.
  */
 function createRefresher(): (credential: V2OAuthCredential) => Promise<V2OAuthCredential> {
   const flights = new Map<string, Promise<V2OAuthCredential>>();
@@ -244,8 +260,8 @@ function createRefresher(): (credential: V2OAuthCredential) => Promise<V2OAuthCr
     if (existing) return existing;
     const flight = refreshTokens(credential.refresh, 1).then((tokens) => toCredential(tokens, credential.metadata));
     flights.set(credential.refresh, flight);
-    const forget = (retain: number) => setTimeout(() => flights.delete(credential.refresh), retain).unref();
-    flight.then(() => forget(REFRESH_RETENTION_MS), () => forget(10_000));
+    // A failure may not have reached the server; the token may be tried again after a pause.
+    flight.catch(() => setTimeout(() => flights.delete(credential.refresh), 10_000).unref());
     return flight;
   };
 }
@@ -267,6 +283,14 @@ export function authorizeByPaste(): V2OAuthAuthorization {
       return toCredential(await exchangeCodeForTokens(code, verifier));
     },
   };
+}
+
+/** Instead of the bare 401 Anthropic would send for a request nothing could authenticate. */
+function buildNoCredentialResponse(): Response {
+  return new Response(
+    JSON.stringify({ type: "error", error: { type: "authentication_error", message: `${NO_CREDENTIAL}.` } }),
+    { status: 401, headers: { "content-type": "application/json" } },
+  );
 }
 
 /** The pool's 429 with a marker field, so a real Anthropic rate limit is never mistaken for it. */
@@ -359,13 +383,13 @@ async function setup(ctx: V2Context): Promise<() => void> {
     };
   }
 
-  /** The active connection's credential when it is this plugin's login. */
-  async function ownCredential(): Promise<V2OAuthCredential | undefined> {
+  /** The active connection's credential when it is an OAuth login. */
+  async function activeOAuthCredential(): Promise<V2OAuthCredential | undefined> {
     try {
       const connection = await ctx.integration.connection.active(PROVIDER_ID);
       if (connection?.type !== "credential" || connection.method !== "oauth") return undefined;
       const credential = await ctx.integration.connection.resolve(connection);
-      return credential?.type === "oauth" && credential.methodID === METHOD_ID ? credential : undefined;
+      return credential?.type === "oauth" ? credential : undefined;
     } catch {
       return undefined;
     }
@@ -374,18 +398,24 @@ async function setup(ctx: V2Context): Promise<() => void> {
   const onRequest = async (event: V2HttpRequestEvent): Promise<void> => {
     if (event.model.providerID !== PROVIDER_ID) return;
     const original = event.request;
+    // The original never gets an entry: every path that serves it replaces it.
+    pending.skip(original);
     // A credential the user configured in V2 (API key or token) wins. The V1
     // bridge exports ANTHROPIC_API_KEY=oauth-placeholder into its process, so a
     // V2 launched from inside V1 inherits it; that value is never a real key.
     const apiKey = original.headers.get("x-api-key");
     if (apiKey && apiKey !== V1_PLACEHOLDER_KEY) return;
-    // V2 attaches our own login as a bearer itself, so that header only marks a
-    // user's credential when it is not the one this plugin's connection holds.
+    // V2 attaches an OAuth connection as a bearer itself, so that header only
+    // marks a user's credential when it is not the active connection's.
     const bearer = original.headers.get("authorization");
     let own: V2OAuthCredential | undefined;
     if (bearer) {
-      own = await ownCredential();
-      if (!own || bearer !== `Bearer ${own.access}`) return;
+      const active = await activeOAuthCredential();
+      if (!active || bearer !== `Bearer ${active.access}`) return;
+      // V2 imports OpenCode 1's auth.json as method "oauth": nothing in V2
+      // refreshes that login and its refresh token is still OpenCode 1's, so
+      // it is never used; the order below applies instead.
+      if (active.methodID === METHOD_ID) own = active;
     }
 
     let accessToken: string;
@@ -421,25 +451,37 @@ async function setup(ctx: V2Context): Promise<() => void> {
       if (!tokens || tokens.expires < Date.now() + EXPIRY_BUFFER_MS) {
         if (!warnedNoCredential) {
           warnedNoCredential = true;
-          console.error(
-            "[opencode-claude-bridge] no fresh Claude CLI login and no pooled account; run `claude` once to refresh it, connect with the Claude Pro / Max (OAuth) method, or enroll accounts with `claude-pool enroll`",
-          );
+          console.error(`[opencode-claude-bridge] ${NO_CREDENTIAL}`);
         }
+        // Sent as it is, a stale CLI login or the imported OpenCode 1 bearer
+        // only earns a 401 that names no cause.
+        if (bearer || readClaudeCredentials()?.claudeAiOauth) await stashResponse(event, buildNoCredentialResponse());
         return;
       }
+      warnedNoCredential = false;
       accessToken = tokens.access;
     }
 
     const method = original.method;
     const signal = original.signal ?? null;
+    const body = method === "GET" || method === "HEAD" ? undefined : await original.clone().text();
+    const isMessage = method === "POST" && new URL(original.url).pathname.endsWith("/messages");
     const prepared = await prepareRequest(
       original.url,
-      { method, headers: original.headers, body: await original.clone().text(), signal },
+      { method, headers: original.headers, body: isMessage ? body : undefined, signal },
       accessToken,
       { sessionId, deviceId, claudeTools: false, ensureClaudePrefix: true },
     );
     // The body was rewritten, so the original length no longer describes it.
     delete prepared.outHeaders["content-length"];
+    for (const name of Object.keys(prepared.outHeaders)) {
+      if (V2_HEADER.test(name)) delete prepared.outHeaders[name];
+    }
+    if (!isMessage) {
+      event.request = new Request(prepared.finalUrl, { method, headers: prepared.outHeaders, body, signal });
+      pending.skip(event.request);
+      return;
+    }
     // Rotation re-sends prepared.body, so it must carry Claude's tool definitions too.
     let inboundToolNameMap: ToolNames = {};
     if (typeof prepared.body === "string") {
@@ -489,21 +531,40 @@ async function setup(ctx: V2Context): Promise<() => void> {
     }
 
     const { prepared, method, signal, sentAt, inboundToolNameMap } = entry;
-    const settled = await settlePoolResponse({
-      pool,
-      toast,
-      response: event.response,
-      activeLabel: entry.label,
-      outHeaders: prepared.outHeaders,
-      body: prepared.body,
-      ownsUserId: prepared.ownsUserId,
-      send: (headers, body) => globalThis.fetch(prepared.finalUrl, { method, headers, body, signal }),
-      signal,
-      sessionId,
-      deviceId,
-      sentAt,
-    });
-    event.response = wrapV2Response(settled, inboundToolNameMap);
+    // Rotation consumes a failed response; this copy still answers V2 when a
+    // resend rejects (network error) instead of failing the hook.
+    const failed = event.response.ok ? undefined : event.response.clone();
+    // Of settlePoolResponse's answers, only the pool's own 429 (no account
+    // left to rotate to) is toasted under an "exhausted:" key.
+    let exhausted = false;
+    let settled: Response;
+    try {
+      settled = await settlePoolResponse({
+        pool,
+        toast: (variant, message, key) => {
+          if (key?.startsWith("exhausted:")) exhausted = true;
+          toast(variant, message, key);
+        },
+        response: event.response,
+        activeLabel: entry.label,
+        outHeaders: prepared.outHeaders,
+        body: prepared.body,
+        ownsUserId: prepared.ownsUserId,
+        send: (headers, body) => globalThis.fetch(prepared.finalUrl, { method, headers, body, signal }),
+        signal,
+        sessionId,
+        deviceId,
+        sentAt,
+      });
+    } catch (err) {
+      if (!failed) throw err;
+      console.error(
+        `[claude-pool] resending failed (${err instanceof Error ? err.message : String(err)}); passing the HTTP ${failed.status} through`,
+      );
+      settled = failed;
+    }
+    if (failed && settled !== failed) await failed.body?.cancel();
+    event.response = wrapV2Response(exhausted ? await markExhausted(settled) : settled, inboundToolNameMap);
   };
 
   // V2 retries a 429 by default; an exhausted pool only recovers when an

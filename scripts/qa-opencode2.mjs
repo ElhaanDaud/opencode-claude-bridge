@@ -7,10 +7,10 @@
  *        [--placeholder-key] [scenario ...]
  *
  * Every scenario gets a fresh isolated environment (HOME, XDG_*, CLAUDE_CONFIG_DIR,
- * pool account dir, rotation state) and its own fake server, so nothing can reach
- * the user's keychain, real accounts, or anthropic.com. Before OpenCode starts,
- * the plugin's own dist is asked what credentials it can see; anything other
- * than the fake ones aborts the run.
+ * pool account dir, rotation state, a `security` stub first on PATH) and its own
+ * fake server, so nothing can reach the user's keychain, real accounts, or
+ * anthropic.com. Before OpenCode starts, the plugin's own dist is asked what
+ * credentials it can see; anything other than the fake ones aborts the run.
  *
  * Without --placeholder-key ANTHROPIC_API_KEY is unset, as for a real user;
  * with it, ANTHROPIC_API_KEY=oauth-placeholder (what V1 exports).
@@ -31,6 +31,12 @@ const RUN_TIMEOUT_MS = 90_000;
 const RETRY_TIMEOUT_MS = 45_000;
 const FAKE_TEXT = "FAKE-REPLY-7731";
 const CLAUDE_PREFIX = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+// On macOS the plugin asks `security` for the Claude CLI login before it reads
+// CLAUDE_CONFIG_DIR, so every child gets this stand-in: nothing found, nothing written.
+const SECURITY_STUB = `#!/bin/sh
+echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2
+exit 44
+`;
 
 // ── args ────────────────────────────────────────────────────────────
 
@@ -161,6 +167,7 @@ async function makeEnv({ script = [textStep()], plugin = true, creds = true } = 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "qa-oc2-"));
   const dirs = {
     root,
+    bin: path.join(root, "bin"),
     home: path.join(root, "home"),
     claude: path.join(root, "claude"),
     accounts: path.join(root, "accounts"),
@@ -168,12 +175,13 @@ async function makeEnv({ script = [textStep()], plugin = true, creds = true } = 
     config: path.join(root, "xdg", "config"),
     statePath: path.join(root, "rotation-state.json"),
   };
-  for (const d of [dirs.home, dirs.claude, dirs.accounts, dirs.project, path.join(dirs.config, "opencode")]) {
+  for (const d of [dirs.bin, dirs.home, dirs.claude, dirs.accounts, dirs.project, path.join(dirs.config, "opencode")]) {
     fs.mkdirSync(d, { recursive: true });
   }
+  fs.writeFileSync(path.join(dirs.bin, "security"), SECURITY_STUB, { mode: 0o755 });
   const fake = await startFake(script);
   const env = {
-    PATH: process.env.PATH,
+    PATH: [dirs.bin, process.env.PATH].filter(Boolean).join(path.delimiter),
     TMPDIR: process.env.TMPDIR ?? os.tmpdir(),
     LANG: "en_US.UTF-8",
     HOME: dirs.home,
