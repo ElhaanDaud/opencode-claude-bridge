@@ -43,6 +43,8 @@ import { LockTimeoutError, createRotationStateStore, defaultLockPath, defaultSta
 import { truncate } from "./pool/dashboard.js";
 import { autoEnrollIfNew, labelSharingClaudeCliLogin, sharedLoginWarning } from "./pool/enroll.js";
 import { createToaster } from "./pool/notify.js";
+import type { Toaster } from "./pool/notify.js";
+import type { PoolClient } from "./pool/bridge.js";
 import { createAccountStore, createSecretBackend } from "./pool/secret-store.js";
 import type { RotationManager } from "./pool/manager.js";
 import type { RotationDecision } from "./pool/types.js";
@@ -733,16 +735,25 @@ export function stripMessageCacheControlPreservingTail(
 /**
  * Claude Code's captured system prompt leads (billing header first), and
  * OpenCode's own system blocks — agent prompt, AGENTS.md, instructions — follow
- * instead of being discarded.
+ * instead of being discarded. The identity line both carry is kept once.
  */
 export function mergeClaudeSystemPrompt(
   billingHeader: string,
   claudeBlocks: Array<{ type?: string; text?: string }>,
   opencodeBlocks: Array<{ type?: string; text?: string }>,
 ): Array<{ type?: string; text?: string }> {
-  const own = opencodeBlocks.filter(
+  let own = opencodeBlocks.filter(
     (block) => !block.text?.startsWith("x-anthropic-billing-header:"),
   );
+  // Both prompts open with the identity line; send it once.
+  if (claudeBlocks.some((block) => block.text?.includes(CLAUDE_PREFIX))) {
+    const lead = `${CLAUDE_PREFIX}\n\n`;
+    own = own
+      .filter((block) => block.text?.trim() !== CLAUDE_PREFIX)
+      .map((block) =>
+        block.text?.startsWith(lead) ? { ...block, text: block.text.slice(lead.length) } : block,
+      );
+  }
   return [{ type: "text", text: billingHeader }, ...claudeBlocks, ...own];
 }
 
@@ -811,7 +822,7 @@ function currentPromptCache(): ClaudeSystemPromptCache | null {
   return promptCache;
 }
 
-function getStableDeviceId(): string {
+export function getStableDeviceId(): string {
   let who = "unknown";
   try {
     who = `${userInfo().username}@${hostname()}`;
@@ -875,17 +886,493 @@ async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | nu
   return pending;
 }
 
-// ── Plugin ─────────────────────────────────────────────────────────
+async function buildUserId(token: string, deviceId: string, sessionId: string): Promise<string | undefined> {
+  const profile = await fetchOAuthProfile(token);
+  if (!profile?.account?.uuid) return undefined;
+  return JSON.stringify({
+    device_id: deviceId,
+    account_uuid: profile.account.uuid,
+    session_id: sessionId,
+  });
+}
 
-const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
-  // Save and clear ANTHROPIC_API_KEY so SDK doesn't bypass our fetch.
-  // Restored if OAuth isn't active (API key providers still work).
-  const savedApiKey = process.env.ANTHROPIC_API_KEY;
-  const sessionId = SESSION_ID || randomUUID();
-  const deviceId = getStableDeviceId();
+function ensureClaudePrefix(system: Array<{ type?: string; text?: string }>): void {
+  if (system.some((block) => block.text?.includes(CLAUDE_PREFIX))) return;
+  const first = system.find((block) => block.type === "text" && typeof block.text === "string");
+  if (first) first.text = `${CLAUDE_PREFIX}\n\n${first.text}`;
+  else system.push({ type: "text", text: CLAUDE_PREFIX });
+}
 
-  const toast = createToaster(client);
+export interface PreparedRequest {
+  finalUrl: string;
+  outHeaders: Record<string, string>;
+  body: BodyInit | null | undefined;
+  /** True when the bridge, not the caller, set metadata.user_id (so rotation must rebind it). */
+  ownsUserId: boolean;
+  /** Claude tool name → OpenCode tool name, for translating the response stream. */
+  inboundToolNameMap: Record<string, string>;
+}
 
+/**
+ * Rewrite one Anthropic request so it matches Claude Code on the wire: OAuth
+ * bearer, Claude Code headers, billing block, system prompt, thinking fields.
+ * `claudeTools` swaps in Claude Code's tool schemas and translates historical
+ * tool_use blocks; it assumes OpenCode V1's tool names.
+ */
+export async function prepareRequest(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+  accessToken: string,
+  opts: { sessionId: string; deviceId: string; claudeTools: boolean; ensureClaudePrefix: boolean },
+): Promise<PreparedRequest> {
+  const { sessionId, deviceId } = opts;
+  // ── Headers ──
+  const headers = new Headers();
+  if (input instanceof Request) mergeHeaders(headers, input.headers);
+  if (init?.headers) mergeHeaders(headers, init.headers);
+
+  headers.set("authorization", `Bearer ${accessToken}`);
+  headers.delete("x-api-key");
+  headers.delete("x-session-affinity");
+  headers.delete("x-session-id");
+  if (!headers.has("accept")) headers.set("accept", "application/json");
+  headers.set("user-agent", getUserAgent());
+  headers.set("x-app", "cli");
+  headers.set("x-claude-code-session-id", sessionId);
+  headers.set("anthropic-version", ANTHROPIC_VERSION);
+  headers.set("anthropic-dangerous-direct-browser-access", "true");
+  for (const [k, v] of Object.entries(STAINLESS_HEADERS)) headers.set(k, v);
+  if (!headers.has("x-stainless-retry-count")) headers.set("x-stainless-retry-count", "0");
+  if (!headers.has("x-stainless-timeout")) headers.set("x-stainless-timeout", "600");
+  headers.set("anthropic-beta", buildBetaFlags(headers.get("anthropic-beta") || ""));
+
+  // ── Body ──
+  const userIdFor = (token: string) => buildUserId(token, deviceId, sessionId);
+  let ownsUserId = false;
+
+  let body = init?.body;
+  let inboundToolNameMap = INBOUND_TOOL_NAME_MAP;
+  if (body && typeof body === "string") {
+    try {
+      const parsed = JSON.parse(body);
+      let requestUrl = "";
+      try {
+        requestUrl = String(
+          new URL(
+            typeof input === "string" ? input
+            : input instanceof URL ? input.toString()
+            : input.url,
+          ),
+        );
+      } catch {}
+
+      // The API rejects a forced tool_choice (any/tool) alongside enabled or
+      // adaptive thinking, and it prefills the forced tool call, so nothing
+      // could be thought before it anyway. The forced tool wins: inject no
+      // thinking, and turn the caller's own off. Models that can't turn
+      // thinking off drop the forced choice instead and keep thinking.
+      let forcesTool = parsed.tool_choice?.type === "any" || parsed.tool_choice?.type === "tool";
+      if (forcesTool && !canDisableThinking(parsed.model)) {
+        delete parsed.tool_choice;
+        forcesTool = false;
+      }
+      const supportsThinking = supportsAdaptiveThinking(parsed.model);
+      if (!parsed.thinking && supportsThinking && !forcesTool) {
+        parsed.thinking = { type: "adaptive" };
+      }
+      if (forcesTool && (parsed.thinking?.type === "enabled" || parsed.thinking?.type === "adaptive")) {
+        parsed.thinking = { type: "disabled" };
+      }
+
+      // Anthropic requires temperature=1 when thinking is enabled/adaptive
+      const thinkingType = parsed.thinking?.type;
+      if (
+        (thinkingType === "enabled" || thinkingType === "adaptive") &&
+        parsed.temperature !== undefined &&
+        parsed.temperature !== 1
+      ) {
+        parsed.temperature = 1;
+      }
+
+      if (typeof parsed.system === "string") {
+        parsed.system = [{ type: "text", text: parsed.system }];
+      }
+      if (!parsed.system) parsed.system = [];
+      if (opts.ensureClaudePrefix) ensureClaudePrefix(parsed.system);
+      if (Array.isArray(parsed.messages)) {
+        stripMessageCacheControlPreservingTail(parsed.messages);
+        parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
+      }
+      // context_management and output_config.effort are only
+      // supported by thinking-capable models. Sending them to
+      // Haiku 4.5 produces a 400.
+      if (supportsThinking) {
+        if (!parsed.context_management) {
+          parsed.context_management = {
+            edits: [{ type: CLEAR_THINKING_TYPE, keep: "all" }],
+          };
+        }
+        if (!parsed.output_config) {
+          parsed.output_config = { effort: DEFAULT_EFFORT };
+        }
+      }
+      normalizeThinkingForSonnet55(parsed);
+      normalizeThinkingForHaiku55(parsed);
+
+      if (!parsed.metadata) parsed.metadata = {};
+      if (!parsed.metadata.user_id) {
+        ownsUserId = true;
+        const userId = await userIdFor(accessToken);
+        if (userId) parsed.metadata.user_id = userId;
+      }
+
+      // Compute dynamic fingerprint from the first user message
+      // (matches Claude Code's per-request fingerprint behavior).
+      let dynamicFingerprint: string | undefined;
+      if (parsed.messages && Array.isArray(parsed.messages)) {
+        const firstText = extractFirstUserMessageText(parsed.messages);
+        if (firstText) {
+          dynamicFingerprint = computeFingerprint(firstText);
+        }
+      }
+
+      // Inject billing header as first system block (required for OAuth).
+      const hasBilling = parsed.system.some(
+        (s: { text?: string }) =>
+          s.text?.startsWith("x-anthropic-billing-header:"),
+      );
+      const cachedClaudePromptCache = currentPromptCache();
+      const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
+      let billingHeader = buildBillingHeader(sessionId, cachedClaudePromptCache, dynamicFingerprint);
+      if (!hasBilling) {
+        parsed.system.unshift({
+          type: "text",
+          text: billingHeader,
+        });
+      } else {
+        billingHeader = parsed.system[0]?.text || billingHeader;
+      }
+
+      // A locally captured Claude Code system prompt leads; OpenCode's
+      // own blocks (agent prompt, AGENTS.md) follow it.
+      if (cachedClaudeSystem) {
+        const rewritten = rewriteSystemBlocksForModel(
+          cachedClaudeSystem,
+          typeof parsed.model === "string" ? parsed.model : undefined,
+        );
+        parsed.system = mergeClaudeSystemPrompt(billingHeader, rewritten, parsed.system);
+      } else if (parsed.system && Array.isArray(parsed.system)) {
+        // Otherwise keep the existing prompt but shape it closer to Claude Code.
+        parsed.system = normalizeSystemBlocks(parsed.system);
+      }
+      parsed.system = stripSystemCacheControl(parsed.system);
+
+      // Keep OpenCode's default tool schemas for non-Claude targets.
+      // Claude wire schemas are only useful for Anthropic-native
+      // requests or Claude-family models on Anthropic-compatible
+      // routers such as OpenRouter.
+      if (opts.claudeTools) {
+        if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
+          inboundToolNameMap = getInboundToolNameMapForActiveOpenCodeTools(parsed.tools);
+          parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
+          if (parsed.tool_choice?.type === "tool") {
+            parsed.tool_choice = { ...parsed.tool_choice, name: mapOutboundToolName(parsed.tool_choice.name) };
+          }
+        }
+      }
+
+      // Normalize message content blocks:
+      // - Translate tool names (OpenCode → Claude Code)
+      // - Translate tool_use input arguments (camelCase → snake_case)
+      if (parsed.messages && Array.isArray(parsed.messages)) {
+        for (const msg of parsed.messages) {
+          if (!Array.isArray(msg.content)) continue;
+          for (const block of msg.content) {
+            if (opts.claudeTools && block.type === "tool_use" && block.name) {
+              block.name = mapOutboundToolName(block.name);
+              // Consolidated OpenCode → Claude argument translation:
+              // key renames, Agent/AskUserQuestion/Skill/WebFetch/TodoWrite
+              // field bridging. Mirrors translateToolArgsJsonString
+              // (inbound) so round-trips preserve meaning. See
+              // translateArgsOpencodeToClaude in claude-tools.ts.
+              if (block.input && typeof block.input === "object") {
+                block.input = translateArgsOpencodeToClaude(
+                  block.name,
+                  block.input as Record<string, unknown>,
+                );
+              }
+            }
+            // tool_result blocks reference tool names via tool_use_id,
+            // no name translation needed here.
+          }
+        }
+      }
+
+      body = JSON.stringify(parsed);
+    } catch (err) {
+      ownsUserId = false;
+      console.error(
+        `[opencode-claude-bridge] request rewrite failed; sending the body unmodified: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // ── URL: add ?beta=true ──
+  let requestUrl: URL | null = null;
+  try {
+    requestUrl = new URL(
+      typeof input === "string" ? input
+        : input instanceof URL ? input.toString()
+        : input.url,
+    );
+  } catch {}
+
+  if (requestUrl?.pathname === "/messages") {
+    requestUrl.pathname = "/v1/messages";
+  }
+  if (requestUrl?.pathname === "/v1/messages" && !requestUrl.searchParams.has("beta")) {
+    requestUrl.searchParams.set("beta", "true");
+  }
+  const finalUrl = requestUrl?.toString()
+    ?? (input instanceof Request ? input.url : String(input));
+
+  const outHeaders: Record<string, string> = {};
+  headers.forEach((v, k) => { outHeaders[k] = v; });
+  return { finalUrl, outHeaders, body, ownsUserId, inboundToolNameMap };
+}
+
+export interface SettleInput {
+  pool: RotationManager;
+  toast: Toaster;
+  response: Response;
+  activeLabel: string;
+  outHeaders: Record<string, string>;
+  body: BodyInit | null | undefined;
+  ownsUserId: boolean;
+  send: (headers: Record<string, string>, body: BodyInit | null | undefined) => Promise<Response>;
+  signal?: AbortSignal | null;
+  sessionId: string;
+  deviceId: string;
+  /** When the response's request was sent; defaults to now. Resends update it. */
+  sentAt?: number;
+}
+
+/**
+ * Pool failure handling for one request served by `activeLabel`: retry,
+ * rotate or pass through, then record success. Returns the response to hand
+ * downstream. Mutates `outHeaders` with the serving account's bearer.
+ */
+export async function settlePoolResponse(input: SettleInput): Promise<Response> {
+  const { pool, toast, outHeaders, ownsUserId, signal, sessionId, deviceId } = input;
+  let { response, activeLabel, body } = input;
+  // Send time of the latest attempt, so its success can't undo a penalty
+  // recorded while it was in flight.
+  let sentAt = input.sentAt ?? Date.now();
+  const send: SettleInput["send"] = (headers, sendBody) => {
+    sentAt = Date.now();
+    return input.send(headers, sendBody);
+  };
+  // Pool-aware failure handling. This runs BEFORE response.body is
+  // read below, which is the only point where rotation is safe: once
+  // SSE streaming has begun, a second stream's message ids and
+  // content-block indices cannot be spliced into the first.
+  //
+  // Only non-2xx bodies are consumed here (short JSON error
+  // envelopes, never a live stream), and they are rebuilt verbatim
+  // before being handed downstream.
+  if (!response.ok) {
+    const maxRotations = (await pool.listLabels()).length;
+    let rotations = 0;
+    let attempt = 0;
+    // One wait budget across every retry and account: a pool where each
+    // account says "retry in 60s" would otherwise hang the request for
+    // minutes. Past it, the account cools down and rotation takes over.
+    let waitedMs = 0;
+    const tried = new Set<string>();
+    const refreshed = new Set<string>();
+    // 401/403 penalties wait until another account SUCCEEDS with the same
+    // request: an identical failure blames the request, and a 429 or 5xx
+    // from the next account says nothing about the first one.
+    const unconfirmed: Array<{ label: string; decision: RotationDecision; signature: string }> = [];
+    const confirmPenalties = async () => {
+      for (const { label, decision } of unconfirmed.splice(0)) {
+        await recordPoolState(`penalty for "${label}"`, () => pool.applyDecision(label, decision));
+      }
+    };
+    const unconfirmedLabels = () => unconfirmed.map((u) => `"${u.label}"`).join(", ");
+
+    for (;;) {
+      const headers: Record<string, string> = {};
+      response.headers.forEach((v, k) => {
+        headers[k.toLowerCase()] = v;
+      });
+      const bodyText = await response.text();
+      const rebuild = () => {
+        // response.text() already decoded the body, so carrying the
+        // original content-encoding/content-length would describe
+        // bytes that no longer exist and corrupt the error downstream.
+        const outbound = new Headers(response.headers);
+        outbound.delete("content-encoding");
+        outbound.delete("content-length");
+        return new Response(bodyText, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: outbound,
+        });
+      };
+
+      const decision = pool.classifyResponse({
+        status: response.status,
+        headers,
+        bodyText,
+        now: Date.now(),
+        attempt,
+        waitBudgetMs: MAX_RETRY_DELAY_MS - waitedMs,
+      });
+
+      if (decision.action === "PASS_THROUGH") {
+        if (unconfirmed.length > 0) {
+          console.error(
+            `[claude-pool] no other account succeeded, so ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} not penalised`,
+          );
+        }
+        return rebuild();
+      }
+
+      if (decision.action === "RETRY_SAME") {
+        attempt += 1;
+        waitedMs += decision.backoffMs ?? 1000;
+        console.error(
+          `[claude-pool] ${activeLabel}: ${decision.reason}; retrying in ${decision.backoffMs ?? 1000}ms`,
+        );
+        await abortableSleep(decision.backoffMs ?? 1000, signal);
+        response = await send(outHeaders, body);
+        if (response.ok) {
+          await confirmPenalties();
+          break;
+        }
+        continue;
+      }
+
+      // ROTATE_COOLDOWN / ROTATE_DISABLE
+      const signature = failureSignature(response.status, bodyText);
+      const repeated = unconfirmed.find((u) => u.signature === signature);
+      if (repeated) {
+        console.error(
+          `[claude-pool] "${repeated.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
+        );
+        return rebuild();
+      }
+
+      // A 401 may mean only the access token was revoked while its
+      // refresh token still works: refresh once through the pool's
+      // locked, journaled path and resend before blaming the account.
+      if (response.status === 401 && !refreshed.has(activeLabel)) {
+        refreshed.add(activeLabel);
+        const rejectedToken = outHeaders["authorization"]!.replace(/^Bearer /, "");
+        let freshToken: string | null = null;
+        try {
+          freshToken = (await pool.refreshLabel(activeLabel, rejectedToken)).access;
+        } catch (err) {
+          console.error(
+            `[claude-pool] ${activeLabel}: refresh after 401 failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (freshToken && freshToken !== rejectedToken) {
+          console.error(`[claude-pool] ${activeLabel}: 401 from Anthropic; refreshed the token, retrying once`);
+          outHeaders["authorization"] = `Bearer ${freshToken}`;
+          response = await send(outHeaders, body);
+          if (response.ok) {
+            await confirmPenalties();
+            break;
+          }
+          continue;
+        }
+      }
+      tried.add(activeLabel);
+
+      if (response.status === 401 || response.status === 403) {
+        console.error(
+          `[claude-pool] ${activeLabel}: ${decision.reason}; checking another account before penalising`,
+        );
+        unconfirmed.push({ label: activeLabel, decision, signature });
+      } else {
+        console.error(
+          `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
+        );
+        const penalised = activeLabel;
+        await recordPoolState(`penalty for "${penalised}"`, () => pool.applyDecision(penalised, decision));
+      }
+
+      rotations += 1;
+      if (rotations > maxRotations) return rebuild();
+
+      let next: Awaited<ReturnType<typeof pool.acquire>>;
+      try {
+        next = await pool.acquire(tried);
+      } catch (err) {
+        if (!(err instanceof LockTimeoutError)) throw err;
+        console.error(`[claude-pool] ${err.message}; passing the current error through`);
+        return rebuild();
+      }
+      if (next.kind === "exhausted" && unconfirmed.length > 0) {
+        // Unconfirmed disables need manual repair; surface the real error.
+        console.error(
+          `[claude-pool] no other account available to confirm ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} at fault; passing the error through without penalising`,
+        );
+        return rebuild();
+      }
+      if (next.kind === "exhausted") {
+        const message = pool.describeExhaustion(next.info);
+        console.error(`[claude-pool] ${message}`);
+        toast("warning", message, `exhausted:${next.info.earliestReset}`);
+        return buildPoolExhaustedResponse(
+          message,
+          next.info.earliestReset,
+          Date.now(),
+        );
+      }
+
+      const why = unconfirmed.at(-1)?.label === activeLabel
+        ? `HTTP ${response.status}, checking another account`
+        : truncate(decision.reason, 60);
+      toast("info", `Switched from "${activeLabel}" to "${next.label}" (${why})`);
+      activeLabel = next.label;
+      outHeaders["authorization"] = `Bearer ${next.accessToken}`;
+      if (ownsUserId && typeof body === "string") {
+        const rebound = JSON.parse(body);
+        const userId = await buildUserId(next.accessToken, deviceId, sessionId);
+        rebound.metadata ??= {};
+        if (userId) rebound.metadata.user_id = userId;
+        else delete rebound.metadata.user_id;
+        body = JSON.stringify(rebound);
+      }
+      attempt = 0;
+      console.error(`[claude-pool] now using account "${activeLabel}"`);
+      response = await send(outHeaders, body);
+      if (response.ok) {
+        await confirmPenalties();
+        break;
+      }
+    }
+  }
+
+  if (response.ok) {
+    const served = activeLabel;
+    await recordPoolState(`success for "${served}"`, () => pool.markSuccess(served, sentAt));
+  }
+  return response;
+}
+
+export interface StartedPool {
+  pool: RotationManager;
+  initiallyActive: boolean;
+  /** Re-checks enrollment at most every POOL_RECHECK_MS. */
+  currentPoolActive: () => Promise<boolean>;
+}
+
+/** Pool start-up shared by the V1 and V2 entrypoints. */
+export async function startPool(client: PoolClient, toast: Toaster): Promise<StartedPool> {
   // Multi-account pool. Inactive until the user enrolls an account, in which
   // case every path below falls back to the original single-account behaviour.
   const pool: RotationManager = createPool(client, {
@@ -966,6 +1453,22 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
     }
     return poolActive;
   };
+
+  return { pool, initiallyActive: poolActive, currentPoolActive };
+}
+
+// ── Plugin ─────────────────────────────────────────────────────────
+
+const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
+  // Save and clear ANTHROPIC_API_KEY so SDK doesn't bypass our fetch.
+  // Restored if OAuth isn't active (API key providers still work).
+  const savedApiKey = process.env.ANTHROPIC_API_KEY;
+  const sessionId = SESSION_ID || randomUUID();
+  const deviceId = getStableDeviceId();
+
+  const toast = createToaster(client);
+
+  const { pool, initiallyActive: poolActive, currentPoolActive } = await startPool(client, toast);
 
   // Bootstrap auth at plugin init time — before OpenCode builds its provider
   // state — so the loader runs on startup and models appear immediately
@@ -1104,224 +1607,10 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               return buildAuthFailureResponse("No usable OAuth access token is available.");
             }
 
-            // ── Headers ──
-            const headers = new Headers();
-            if (input instanceof Request) mergeHeaders(headers, input.headers);
-            if (init?.headers) mergeHeaders(headers, init.headers);
-
-            headers.set("authorization", `Bearer ${accessToken}`);
-            headers.delete("x-api-key");
-            headers.delete("x-session-affinity");
-            headers.delete("x-session-id");
-            if (!headers.has("accept")) headers.set("accept", "application/json");
-            headers.set("user-agent", getUserAgent());
-            headers.set("x-app", "cli");
-            headers.set("x-claude-code-session-id", sessionId);
-            headers.set("anthropic-version", ANTHROPIC_VERSION);
-            headers.set("anthropic-dangerous-direct-browser-access", "true");
-            for (const [k, v] of Object.entries(STAINLESS_HEADERS)) headers.set(k, v);
-            if (!headers.has("x-stainless-retry-count")) headers.set("x-stainless-retry-count", "0");
-            if (!headers.has("x-stainless-timeout")) headers.set("x-stainless-timeout", "600");
-            headers.set("anthropic-beta", buildBetaFlags(headers.get("anthropic-beta") || ""));
-
-            // ── Body ──
-            const userIdFor = async (token: string): Promise<string | undefined> => {
-              const profile = await fetchOAuthProfile(token);
-              if (!profile?.account?.uuid) return undefined;
-              return JSON.stringify({
-                device_id: deviceId,
-                account_uuid: profile.account.uuid,
-                session_id: sessionId,
-              });
-            };
-            let ownsUserId = false;
-
-            let body = init?.body;
-            let inboundToolNameMap = INBOUND_TOOL_NAME_MAP;
-            if (body && typeof body === "string") {
-              try {
-                const parsed = JSON.parse(body);
-                let requestUrl = "";
-                try {
-                  requestUrl = String(
-                    new URL(
-                      typeof input === "string" ? input
-                      : input instanceof URL ? input.toString()
-                      : input.url,
-                    ),
-                  );
-                } catch {}
-
-                // The API rejects a forced tool_choice (any/tool) alongside enabled or
-                // adaptive thinking, and it prefills the forced tool call, so nothing
-                // could be thought before it anyway. The forced tool wins: inject no
-                // thinking, and turn the caller's own off. Models that can't turn
-                // thinking off drop the forced choice instead and keep thinking.
-                let forcesTool = parsed.tool_choice?.type === "any" || parsed.tool_choice?.type === "tool";
-                if (forcesTool && !canDisableThinking(parsed.model)) {
-                  delete parsed.tool_choice;
-                  forcesTool = false;
-                }
-                const supportsThinking = supportsAdaptiveThinking(parsed.model);
-                if (!parsed.thinking && supportsThinking && !forcesTool) {
-                  parsed.thinking = { type: "adaptive" };
-                }
-                if (forcesTool && (parsed.thinking?.type === "enabled" || parsed.thinking?.type === "adaptive")) {
-                  parsed.thinking = { type: "disabled" };
-                }
-
-                // Anthropic requires temperature=1 when thinking is enabled/adaptive
-                const thinkingType = parsed.thinking?.type;
-                if (
-                  (thinkingType === "enabled" || thinkingType === "adaptive") &&
-                  parsed.temperature !== undefined &&
-                  parsed.temperature !== 1
-                ) {
-                  parsed.temperature = 1;
-                }
-
-                if (typeof parsed.system === "string") {
-                  parsed.system = [{ type: "text", text: parsed.system }];
-                }
-                if (!parsed.system) parsed.system = [];
-                if (Array.isArray(parsed.messages)) {
-                  stripMessageCacheControlPreservingTail(parsed.messages);
-                  parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
-                }
-                // context_management and output_config.effort are only
-                // supported by thinking-capable models. Sending them to
-                // Haiku 4.5 produces a 400.
-                if (supportsThinking) {
-                  if (!parsed.context_management) {
-                    parsed.context_management = {
-                      edits: [{ type: CLEAR_THINKING_TYPE, keep: "all" }],
-                    };
-                  }
-                  if (!parsed.output_config) {
-                    parsed.output_config = { effort: DEFAULT_EFFORT };
-                  }
-                }
-                normalizeThinkingForSonnet55(parsed);
-                normalizeThinkingForHaiku55(parsed);
-
-                if (!parsed.metadata) parsed.metadata = {};
-                if (!parsed.metadata.user_id) {
-                  ownsUserId = true;
-                  const userId = await userIdFor(accessToken);
-                  if (userId) parsed.metadata.user_id = userId;
-                }
-
-                // Compute dynamic fingerprint from the first user message
-                // (matches Claude Code's per-request fingerprint behavior).
-                let dynamicFingerprint: string | undefined;
-                if (parsed.messages && Array.isArray(parsed.messages)) {
-                  const firstText = extractFirstUserMessageText(parsed.messages);
-                  if (firstText) {
-                    dynamicFingerprint = computeFingerprint(firstText);
-                  }
-                }
-
-                // Inject billing header as first system block (required for OAuth).
-                const hasBilling = parsed.system.some(
-                  (s: { text?: string }) =>
-                    s.text?.startsWith("x-anthropic-billing-header:"),
-                );
-                const cachedClaudePromptCache = currentPromptCache();
-                const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
-                let billingHeader = buildBillingHeader(sessionId, cachedClaudePromptCache, dynamicFingerprint);
-                if (!hasBilling) {
-                  parsed.system.unshift({
-                    type: "text",
-                    text: billingHeader,
-                  });
-                } else {
-                  billingHeader = parsed.system[0]?.text || billingHeader;
-                }
-
-                // A locally captured Claude Code system prompt leads; OpenCode's
-                // own blocks (agent prompt, AGENTS.md) follow it.
-                if (cachedClaudeSystem) {
-                  const rewritten = rewriteSystemBlocksForModel(
-                    cachedClaudeSystem,
-                    typeof parsed.model === "string" ? parsed.model : undefined,
-                  );
-                  parsed.system = mergeClaudeSystemPrompt(billingHeader, rewritten, parsed.system);
-                } else if (parsed.system && Array.isArray(parsed.system)) {
-                  // Otherwise keep the existing prompt but shape it closer to Claude Code.
-                  parsed.system = normalizeSystemBlocks(parsed.system);
-                }
-                parsed.system = stripSystemCacheControl(parsed.system);
-
-                // Keep OpenCode's default tool schemas for non-Claude targets.
-                // Claude wire schemas are only useful for Anthropic-native
-                // requests or Claude-family models on Anthropic-compatible
-                // routers such as OpenRouter.
-                if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
-                  inboundToolNameMap = getInboundToolNameMapForActiveOpenCodeTools(parsed.tools);
-                  parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
-                  if (parsed.tool_choice?.type === "tool") {
-                    parsed.tool_choice = { ...parsed.tool_choice, name: mapOutboundToolName(parsed.tool_choice.name) };
-                  }
-                }
-
-                // Normalize message content blocks:
-                // - Translate tool names (OpenCode → Claude Code)
-                // - Translate tool_use input arguments (camelCase → snake_case)
-                if (parsed.messages && Array.isArray(parsed.messages)) {
-                  for (const msg of parsed.messages) {
-                    if (!Array.isArray(msg.content)) continue;
-                    for (const block of msg.content) {
-                      if (block.type === "tool_use" && block.name) {
-                        block.name = mapOutboundToolName(block.name);
-                        // Consolidated OpenCode → Claude argument translation:
-                        // key renames, Agent/AskUserQuestion/Skill/WebFetch/TodoWrite
-                        // field bridging. Mirrors translateToolArgsJsonString
-                        // (inbound) so round-trips preserve meaning. See
-                        // translateArgsOpencodeToClaude in claude-tools.ts.
-                        if (block.input && typeof block.input === "object") {
-                          block.input = translateArgsOpencodeToClaude(
-                            block.name,
-                            block.input as Record<string, unknown>,
-                          );
-                        }
-                      }
-                      // tool_result blocks reference tool names via tool_use_id,
-                      // no name translation needed here.
-                    }
-                  }
-                }
-
-                body = JSON.stringify(parsed);
-              } catch (err) {
-                ownsUserId = false;
-                console.error(
-                  `[opencode-claude-bridge] request rewrite failed; sending the body unmodified: ${err instanceof Error ? err.message : String(err)}`,
-                );
-              }
-            }
-
-            // ── URL: add ?beta=true ──
-            let requestUrl: URL | null = null;
-            try {
-              requestUrl = new URL(
-                typeof input === "string" ? input
-                  : input instanceof URL ? input.toString()
-                  : input.url,
-              );
-            } catch {}
-
-            if (requestUrl?.pathname === "/messages") {
-              requestUrl.pathname = "/v1/messages";
-            }
-            if (requestUrl?.pathname === "/v1/messages" && !requestUrl.searchParams.has("beta")) {
-              requestUrl.searchParams.set("beta", "true");
-            }
-            const finalUrl = requestUrl?.toString()
-              ?? (input instanceof Request ? input.url : String(input));
-
-            // ── Request (with 429 auto-refresh retry) ──
-            const outHeaders: Record<string, string> = {};
-            headers.forEach((v, k) => { outHeaders[k] = v; });
+            const prepared = await prepareRequest(input, init, accessToken, {
+              sessionId, deviceId, claudeTools: true, ensureClaudePrefix: false,
+            });
+            const { finalUrl, outHeaders, body, inboundToolNameMap } = prepared;
 
             // Send time of the latest attempt, so its success can't undo a
             // penalty recorded while it was in flight.
@@ -1338,194 +1627,15 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
             let response = await doFetch();
 
-            // Pool-aware failure handling. This runs BEFORE response.body is
-            // read below, which is the only point where rotation is safe: once
-            // SSE streaming has begun, a second stream's message ids and
-            // content-block indices cannot be spliced into the first.
-            //
-            // Only non-2xx bodies are consumed here (short JSON error
-            // envelopes, never a live stream), and they are rebuilt verbatim
-            // before being handed downstream.
-            if (usePool && activeLabel && !response.ok) {
-              const maxRotations = (await pool.listLabels()).length;
-              let rotations = 0;
-              let attempt = 0;
-              // One wait budget across every retry and account: a pool where each
-              // account says "retry in 60s" would otherwise hang the request for
-              // minutes. Past it, the account cools down and rotation takes over.
-              let waitedMs = 0;
-              const tried = new Set<string>();
-              const refreshed = new Set<string>();
-              // 401/403 penalties wait until another account SUCCEEDS with the same
-              // request: an identical failure blames the request, and a 429 or 5xx
-              // from the next account says nothing about the first one.
-              const unconfirmed: Array<{ label: string; decision: RotationDecision; signature: string }> = [];
-              const confirmPenalties = async () => {
-                for (const { label, decision } of unconfirmed.splice(0)) {
-                  await recordPoolState(`penalty for "${label}"`, () => pool.applyDecision(label, decision));
-                }
-              };
-              const unconfirmedLabels = () => unconfirmed.map((u) => `"${u.label}"`).join(", ");
-
-              for (;;) {
-                const headers: Record<string, string> = {};
-                response.headers.forEach((v, k) => {
-                  headers[k.toLowerCase()] = v;
-                });
-                const bodyText = await response.text();
-                const rebuild = () => {
-                  // response.text() already decoded the body, so carrying the
-                  // original content-encoding/content-length would describe
-                  // bytes that no longer exist and corrupt the error downstream.
-                  const outbound = new Headers(response.headers);
-                  outbound.delete("content-encoding");
-                  outbound.delete("content-length");
-                  return new Response(bodyText, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: outbound,
-                  });
-                };
-
-                const decision = pool.classifyResponse({
-                  status: response.status,
-                  headers,
-                  bodyText,
-                  now: Date.now(),
-                  attempt,
-                  waitBudgetMs: MAX_RETRY_DELAY_MS - waitedMs,
-                });
-
-                if (decision.action === "PASS_THROUGH") {
-                  if (unconfirmed.length > 0) {
-                    console.error(
-                      `[claude-pool] no other account succeeded, so ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} not penalised`,
-                    );
-                  }
-                  return rebuild();
-                }
-
-                if (decision.action === "RETRY_SAME") {
-                  attempt += 1;
-                  waitedMs += decision.backoffMs ?? 1000;
-                  console.error(
-                    `[claude-pool] ${activeLabel}: ${decision.reason}; retrying in ${decision.backoffMs ?? 1000}ms`,
-                  );
-                  await abortableSleep(decision.backoffMs ?? 1000, init?.signal);
-                  response = await doFetch();
-                  if (response.ok) {
-                    await confirmPenalties();
-                    break;
-                  }
-                  continue;
-                }
-
-                // ROTATE_COOLDOWN / ROTATE_DISABLE
-                const signature = failureSignature(response.status, bodyText);
-                const repeated = unconfirmed.find((u) => u.signature === signature);
-                if (repeated) {
-                  console.error(
-                    `[claude-pool] "${repeated.label}" and "${activeLabel}" failed identically (HTTP ${response.status}); the request is at fault, not the accounts — passing the error through without penalising either`,
-                  );
-                  return rebuild();
-                }
-
-                // A 401 may mean only the access token was revoked while its
-                // refresh token still works: refresh once through the pool's
-                // locked, journaled path and resend before blaming the account.
-                if (response.status === 401 && !refreshed.has(activeLabel)) {
-                  refreshed.add(activeLabel);
-                  const rejectedToken = outHeaders["authorization"].replace(/^Bearer /, "");
-                  let freshToken: string | null = null;
-                  try {
-                    freshToken = (await pool.refreshLabel(activeLabel, rejectedToken)).access;
-                  } catch (err) {
-                    console.error(
-                      `[claude-pool] ${activeLabel}: refresh after 401 failed: ${err instanceof Error ? err.message : String(err)}`,
-                    );
-                  }
-                  if (freshToken && freshToken !== rejectedToken) {
-                    console.error(`[claude-pool] ${activeLabel}: 401 from Anthropic; refreshed the token, retrying once`);
-                    outHeaders["authorization"] = `Bearer ${freshToken}`;
-                    response = await doFetch();
-                    if (response.ok) {
-                      await confirmPenalties();
-                      break;
-                    }
-                    continue;
-                  }
-                }
-                tried.add(activeLabel);
-
-                if (response.status === 401 || response.status === 403) {
-                  console.error(
-                    `[claude-pool] ${activeLabel}: ${decision.reason}; checking another account before penalising`,
-                  );
-                  unconfirmed.push({ label: activeLabel, decision, signature });
-                } else {
-                  console.error(
-                    `[claude-pool] ${activeLabel}: ${decision.reason}; rotating account`,
-                  );
-                  const penalised = activeLabel;
-                  await recordPoolState(`penalty for "${penalised}"`, () => pool.applyDecision(penalised, decision));
-                }
-
-                rotations += 1;
-                if (rotations > maxRotations) return rebuild();
-
-                let next: Awaited<ReturnType<typeof pool.acquire>>;
-                try {
-                  next = await pool.acquire(tried);
-                } catch (err) {
-                  if (!(err instanceof LockTimeoutError)) throw err;
-                  console.error(`[claude-pool] ${err.message}; passing the current error through`);
-                  return rebuild();
-                }
-                if (next.kind === "exhausted" && unconfirmed.length > 0) {
-                  // Unconfirmed disables need manual repair; surface the real error.
-                  console.error(
-                    `[claude-pool] no other account available to confirm ${unconfirmedLabels()} ${unconfirmed.length === 1 ? "is" : "are"} at fault; passing the error through without penalising`,
-                  );
-                  return rebuild();
-                }
-                if (next.kind === "exhausted") {
-                  const message = pool.describeExhaustion(next.info);
-                  console.error(`[claude-pool] ${message}`);
-                  toast("warning", message, `exhausted:${next.info.earliestReset}`);
-                  return buildPoolExhaustedResponse(
-                    message,
-                    next.info.earliestReset,
-                    Date.now(),
-                  );
-                }
-
-                const why = unconfirmed.at(-1)?.label === activeLabel
-                  ? `HTTP ${response.status}, checking another account`
-                  : truncate(decision.reason, 60);
-                toast("info", `Switched from "${activeLabel}" to "${next.label}" (${why})`);
-                activeLabel = next.label;
-                outHeaders["authorization"] = `Bearer ${next.accessToken}`;
-                if (ownsUserId && typeof body === "string") {
-                  const rebound = JSON.parse(body);
-                  const userId = await userIdFor(next.accessToken);
-                  rebound.metadata ??= {};
-                  if (userId) rebound.metadata.user_id = userId;
-                  else delete rebound.metadata.user_id;
-                  body = JSON.stringify(rebound);
-                }
-                attempt = 0;
-                console.error(`[claude-pool] now using account "${activeLabel}"`);
-                response = await doFetch();
-                if (response.ok) {
-                  await confirmPenalties();
-                  break;
-                }
-              }
-            }
-
-            if (usePool && activeLabel && response.ok) {
-              const served = activeLabel;
-              await recordPoolState(`success for "${served}"`, () => pool.markSuccess(served, sentAt));
+            if (usePool && activeLabel) {
+              response = await settlePoolResponse({
+                pool, toast, response, activeLabel, outHeaders, body,
+                ownsUserId: prepared.ownsUserId,
+                send: (headers, sendBody) => globalThis.fetch(finalUrl, {
+                  method: init?.method || "POST", body: sendBody, headers, signal: init?.signal,
+                }),
+                signal: init?.signal, sessionId, deviceId, sentAt,
+              });
             }
 
             if (!usePool && response.status === 401) {

@@ -102,6 +102,28 @@ on Linux — the JSON above shows the macOS form).
 Do **not** add an `anthropic` provider block. The bridge registers that
 provider itself and owns the transport; a manual block competes with it.
 
+### 3.3 OpenCode 2 instead
+
+OpenCode 2 cannot load V1 plugins and only accepts a directory as a local
+plugin, so skip the wrapper and point V2's `plugins` key at the build's
+`dist/opencode2` directory:
+
+```jsonc
+{
+  "plugins": [
+    "file:///Users/YOUR_USERNAME/src/opencode-claude-bridge/dist/opencode2"
+  ]
+}
+```
+
+V1 and V2 read the same config locations, so do not keep the V1 `plugin`
+entry in a config V2 loads: V2 migrates it and fails to load the wrapper.
+Confirm it loaded: `opencode run --standalone --print-logs -m anthropic/claude-haiku-4-5-20251001 "Reply
+with exactly: OK"` shows a `loading plugin` line for `dist/opencode2/server.js`
+(`opencode plugin list` doesn't list directory plugins on 2.1).
+Enrollment and the pool are shared; everything in §4 onwards applies
+unchanged. See the README's OpenCode 2 section for what differs from V1.
+
 ---
 
 ## 4. Enroll your accounts

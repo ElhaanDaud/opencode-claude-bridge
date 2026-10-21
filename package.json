@@ -5,6 +5,21 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/opencode2/server.d.ts",
+      "default": "./dist/opencode2/server.js"
+    },
+    "./tui": {
+      "types": "./dist/opencode2/tui.d.ts",
+      "default": "./dist/opencode2/tui.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist"
   ],

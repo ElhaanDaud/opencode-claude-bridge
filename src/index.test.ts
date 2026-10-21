@@ -349,6 +349,36 @@ describe("system prompt merge", () => {
       "AGENTS.md rules",
     ]);
   });
+
+  it("sends the identity line once when both prompts open with it", () => {
+    const prefix = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+    const out = mergeClaudeSystemPrompt(
+      "x-anthropic-billing-header: cc_version=1",
+      [{ type: "text", text: prefix }, { type: "text", text: "CLAUDE" }],
+      [
+        { type: "text", text: prefix },
+        { type: "text", text: `${prefix}\n\nagent prompt` },
+        { type: "text", text: "AGENTS.md rules" },
+      ],
+    );
+    assert.deepEqual(out.map((block) => block.text), [
+      "x-anthropic-billing-header: cc_version=1",
+      prefix,
+      "CLAUDE",
+      "agent prompt",
+      "AGENTS.md rules",
+    ]);
+  });
+
+  it("leaves OpenCode's identity line alone when Claude's blocks lack it", () => {
+    const prefix = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+    const out = mergeClaudeSystemPrompt(
+      "x-anthropic-billing-header: cc_version=1",
+      [{ type: "text", text: "CLAUDE" }],
+      [{ type: "text", text: `${prefix}\n\nagent prompt` }],
+    );
+    assert.equal(out[2]?.text, `${prefix}\n\nagent prompt`);
+  });
 });
 
 describe("system prompt without a captured Claude Code prompt", () => {

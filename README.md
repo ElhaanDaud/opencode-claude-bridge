@@ -90,17 +90,40 @@ so no wrapper is needed:
 V1 and V2 read the same config file. Don't keep a V1 `plugin` entry for the
 wrapper there: V2 migrates it and fails to load it.
 
-**3. Restart OpenCode and check** that `opencode plugin list` shows
-`opencode-claude-bridge` with a source ending in `dist/opencode2/server.js`.
+**3. Restart OpenCode and check** that a prompt works:
+`opencode run -m anthropic/claude-haiku-4-5-20251001 "Reply with exactly: OK"`.
+On 2.1, `opencode plugin list` doesn't list directory plugins; `opencode run
+--standalone --print-logs ...` shows a `loading plugin` line for
+`dist/opencode2/server.js`.
+
+**Credentials on V2**, in order: the pool; the "Claude Pro / Max (OAuth)" login
+(`opencode auth login anthropic --method claude-pro-max`, a browser sign-in
+that V2 stores and refreshes); then the Claude CLI login, read-only and never
+refreshed. The V2 login is its own token chain, so refreshing it never logs
+Claude Code out. V2 also imports OpenCode 1's login on first start; the bridge
+never uses that copy, since nothing in V2 refreshes it and its refresh token is
+still OpenCode 1's. When the Claude CLI login has expired and nothing else is
+available, the request isn't sent and OpenCode shows how to log in again. An
+Anthropic API key you configure in V2 takes precedence and is left alone. With
+enrolled accounts or a Claude CLI login, the bridge turns V2's anthropic
+provider on itself, so no key is needed; restart OpenCode after enrolling the
+first account.
 
 Enrollment, `claude-pool` and the pool itself are shared with V1, so
-[Multi-account rotation](#multi-account-rotation) applies unchanged. What
-differs on V2:
+[Multi-account rotation](#multi-account-rotation) applies unchanged. The
+request rewrite (bearer, Claude Code headers, billing block, system prompt,
+thinking fields), pool rotation and Claude Code's tool definitions all work as
+on V1, through V2's `http.request` and `http.response` hooks. What differs:
 
-- Tool schemas are sent as V2 defines them. The Claude Code tool mapping is not applied yet.
-- Pool events are logged rather than shown as toasts, since V2's plugin API has no toast call.
-- Without enrolled accounts it uses the Claude CLI login as-is and never refreshes it. Run `claude` to refresh it, or enroll the account.
-- An Anthropic API key you configure in V2 itself takes precedence, and the bridge leaves those requests alone.
+- Tools without a faithful Claude Code counterpart keep V2's own definition
+  (`patch`, `execute`, MCP tools). Claude arguments V2 has no field for are
+  dropped, e.g. Grep's `output_mode` and context lines, WebFetch's `prompt`.
+- Pool toasts come from a separate TUI entry that watches the rotation state
+  file, so a TUI attached to a remote server doesn't show them.
+- When every account is cooling, the request isn't sent: OpenCode shows the
+  pool's message and doesn't retry. Rotation that runs out of accounts
+  mid-request ends the same way.
+- V2 has no `auth.json`, so nothing is mirrored there.
 
 **Upgrade:** `cd ~/src/opencode-claude-bridge && git pull && npm ci && npm run build`, then restart OpenCode.
 
@@ -363,7 +386,7 @@ CLI's own stored copy of that credential is stale.** That is expected. Run
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1.2+, or v2 via the `feat/opencode-2` branch (tested on 2.0.32; see [OpenCode 2](#opencode-2-manual))
+- [OpenCode](https://opencode.ai) v1.2+, or v2 via the `feat/opencode-2` branch (tested on 2.1.2; see [OpenCode 2](#opencode-2-manual))
 - For OAuth: [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in (`claude login`)
 - macOS (Keychain) or Linux (`~/.claude/.credentials.json` fallback)
 - For API key: just configure a `provider` with `apiKey` in your OpenCode config as usual
@@ -394,6 +417,7 @@ All OAuth and header parameters can be overridden via environment variables:
 | `ANTHROPIC_CLEAR_THINKING_TYPE` | `clear_thinking_20251015` | `context_management` edit type |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Where the Claude CLI credential file lives (Linux) |
 | `CLAUDE_POOL_AUTO_ENROLL` | enabled | Set to `0` to disable auto-enrollment on startup |
+| `CLAUDE_POOL_ACCOUNTS_DIR` | unset | Store accounts as 0600 files in this directory on any platform instead of the keychain (testing) |
 | `CLAUDE_POOL_STATE_PATH` | `~/.local/share/opencode-claude-bridge/rotation-state.json` | Rotation state file (the lock stays at the default path) |
 
 Most users won't need to change these. The bridge detects the installed Claude CLI version, re-checks it every 10 minutes since Claude Code auto-updates, and uses matching defaults.
@@ -421,6 +445,17 @@ If OpenCode is being treated as an OAuth app / extra-usage flow, the report will
 
 - The OpenCode run fails with an extra-usage style API error
 - The usage buckets diverge from the Claude Code run even when the headers look similar
+
+To check the OpenCode 2 plugin end to end without touching your accounts:
+
+```bash
+npm run build && node scripts/qa-opencode2.mjs --bin "$(command -v opencode)"
+```
+
+It runs the real OpenCode 2 binary against a local fake Anthropic API in a
+throwaway environment (its own HOME, config and pool), so it never reaches your
+keychain or anthropic.com, and reports PASS/FAIL per scenario: plugin load,
+request rewrite, tool translation, rotation and the exhausted pool.
 
 ## Updating for new Claude CLI versions
 
@@ -454,6 +489,10 @@ src/
   constants.ts       — CLI version detection, URLs, env overrides, header values
   keychain.ts        — Claude CLI credential read (macOS Keychain / credentials file)
   oauth.ts           — OAuth PKCE flow and token refresh
+  opencode2/
+    server.ts        — OpenCode 2 server plugin: request rewrite, rotation, V2 login method
+    tools.ts         — V2 tools <-> Claude Code tool definitions, both directions
+    tui.ts           — OpenCode 2 TUI plugin: pool toasts from the rotation state file
   pool/
     manager.ts       — Account acquisition, refresh with journal + in-flight dedupe
     rotation-state.ts — Rotation state file and cross-process lock
@@ -470,6 +509,7 @@ src/
 scripts/
   claude-pool.mjs             — `claude-pool` CLI (bin entry)
   qa-rotation.mjs             — End-to-end rotation scenarios (real API + local fake upstream)
+  qa-opencode2.mjs            — Real OpenCode 2 binary against a local fake Anthropic API
   validate-opencode-oauth.js  — Side-by-side wire comparison tool
   intercept-claude.sh         — mitmproxy-based Claude CLI request capture
 ```

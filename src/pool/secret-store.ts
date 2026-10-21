@@ -292,6 +292,9 @@ export function createFileBackend(dir: string): SecretBackend {
 }
 
 export function createSecretBackend(): SecretBackend {
+  // Lets test harnesses use an isolated store on any platform, incl. macOS.
+  const override = process.env.CLAUDE_POOL_ACCOUNTS_DIR;
+  if (override) return createFileBackend(override);
   if (process.platform === "darwin") return createKeychainBackend();
   return createFileBackend(join(
     homedir(),
